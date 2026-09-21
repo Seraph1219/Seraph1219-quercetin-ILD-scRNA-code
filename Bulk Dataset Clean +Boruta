@@ -1,0 +1,807 @@
+##R/
+##├── 01_probe_annotation.R      # GPL570/GPL14550 probe → gene symbol
+##├── 02_matrix_clean_merge.R    # 三个 GEO 矩阵清洗、log2、取交集合并
+##├── 03_quality_control_plots.R # 箱线图 + 密度图质控
+##├── 04_metadata_alignment.R    # 元数据与表达矩阵样本对齐
+##├── 05_combat_batch.R          # ComBat 去批次 + PCA/Boxplot 评估
+##├── 06_limma_deg.R            # limma 差异表达 + 火山图 + 热图
+##└── 07_boruta_lasso.R         # Boruta 特征选择 + 稳定性验证 + 输出
+
+
+###01_probe_annotation.R.
+# ==============================================================================
+# Probe-to-Gene Annotation and Deduplication
+# ==============================================================================
+# Objective:
+#   Parse GEO platform (GPL) annotation files, remove multi-gene probes
+#   (e.g., those containing "///"), and resolve one-to-many probe-to-gene
+#   mappings by retaining the first non-empty gene symbol per probe.
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages(library(tidyverse))
+
+# ------------------------------------------------------------------------------
+# 1. Parse GPL570 (Affymetrix HG-U133_Plus_2) annotation
+# ------------------------------------------------------------------------------
+# NOTE: verify the column name "GENE_SYMBOL" matches your actual file header
+anno_gpl570 <- read.table(
+  "GPL570-55999.txt",
+  header      = TRUE,
+  sep         = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  comment.char = "#"
+)
+
+# Count probes mapped to multiple genes (separated by "///")
+multi_gene_count <- sum(str_detect(anno_gpl570$GENE_SYMBOL, "///"))
+cat("GPL570 probes mapped to multiple genes (///):", multi_gene_count, "\n")
+cat("Proportion:", round(multi_gene_count / nrow(anno_gpl570) * 100, 2), "%\n")
+
+# Retain only probes with a single, non-NA, non-empty gene symbol
+anno_clean <- anno_gpl570 %>%
+  filter(
+    !str_detect(GENE_SYMBOL, "///"),
+    !is.na(GENE_SYMBOL),
+    GENE_SYMBOL != ""
+  ) %>%
+  mutate(GENE_SYMBOL = trimws(GENE_SYMBOL))
+
+cat("GPL570 annotation after filtering:", dim(anno_clean), "\n")
+
+write.table(
+  anno_clean,
+  file  = "GPL570-55999_clean.txt",
+  sep   = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 2. Parse GPL14550 (Affymetrix HuGene-1_0-st-v1) / SOFT family file
+# ------------------------------------------------------------------------------
+# The SOFT file may lack a proper header; fall back to manual column naming.
+anno_gpl14550 <- read.table(
+  "GSE47460_family.soft",
+  header         = TRUE,
+  sep            = "\t",
+  stringsAsFactors = FALSE,
+  fill           = TRUE,
+  comment.char   = "#"
+)
+
+# Standardise column names to a common schema: ID_REF + GENE_SYMBOL
+if ("ID" %in% colnames(anno_gpl14550)) {
+  colnames(anno_gpl14550)[colnames(anno_gpl14550) == "ID"] <- "ID_REF"
+} else if ("V1" %in% colnames(anno_gpl14550)) {
+  colnames(anno_gpl14550)[1:2] <- c("ID_REF", "GENE_SYMBOL")
+}
+
+# If the file was read without any header, columns come in as V1, V2, ...
+if (!"GENE_SYMBOL" %in% colnames(anno_gpl14550)) {
+  candidate <- grep("SYMBOL|Gene|gene", colnames(anno_gpl14550), value = TRUE)[1]
+  if (!is.na(candidate)) {
+    colnames(anno_gpl14550)[colnames(anno_gpl14550) == candidate] <- "GENE_SYMBOL"
+  } else {
+    stop("Cannot locate the gene-symbol column in the annotation file.")
+  }
+}
+
+anno_gpl14550 <- anno_gpl14550 %>%
+  mutate(
+    across(c(ID_REF, GENE_SYMBOL), trimws),
+    across(everything(), as.character)
+  )
+
+# Resolve one-to-many mappings: keep the first valid symbol per probe
+anno_gpl14550 <- anno_gpl14550 %>%
+  group_by(ID_REF) %>%
+  summarise(
+    GENE_SYMBOL = first(na.omit(GENE_SYMBOL[GENE_SYMBOL != ""])),
+    .groups     = "drop"
+  )
+
+cat("GPL14550 annotation after deduplication:", dim(anno_gpl14550), "\n")
+
+###02_matrix_clean_merge.R
+# ==============================================================================
+# Expression Matrix Cleaning, Log Transformation, and Multi-Dataset Merging
+# ==============================================================================
+# Objective:
+#   Read three independently normalised GEO expression matrices, strip probe
+#   IDs, collapse multiple probes targeting the same gene (row-mean), apply
+#   log2(x+1) if data are on the raw scale, and retain only genes present in
+#   all three datasets (inner join on gene symbol).
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages({
+  library(tidyverse)
+  library(data.table)
+})
+
+# ------------------------------------------------------------------------------
+# Helper: sanitise a matrix (remove empty rows, collapse duplicate genes)
+# ------------------------------------------------------------------------------
+clean_matrix <- function(mat) {
+  mat <- mat[!is.na(rownames(mat)) & rownames(mat) != "", , drop = FALSE]
+
+  if (any(duplicated(rownames(mat)))) {
+    cat("  Duplicate gene names detected; collapsing by row-mean...\n")
+    df_tmp      <- as.data.frame(mat)
+    df_tmp$Gene <- rownames(df_tmp)
+    agg_df      <- aggregate(. ~ Gene, data = df_tmp, FUN = mean, na.rm = TRUE)
+    rownames(agg_df) <- agg_df$Gene
+    mat <- as.matrix(agg_df[, colnames(agg_df) != "Gene", drop = FALSE])
+  }
+  return(mat)
+}
+
+# ------------------------------------------------------------------------------
+# Read and clean the three datasets
+# ------------------------------------------------------------------------------
+gse1 <- read.csv("GSE47460_GPL14550_clean.csv", row.names = 1, check.names = FALSE)
+gse2 <- read.csv("GSE47460_GPL6480_clean.csv",   row.names = 1, check.names = FALSE)
+gse3 <- read.csv("GSE21411_GPL570_clean.csv",    row.names = 1, check.names = FALSE)
+
+cat("Raw dimensions:\n")
+cat("  GSE47460/GPL14550:", dim(gse1), "\n")
+cat("  GSE47460/GPL6480 :", dim(gse2), "\n")
+cat("  GSE21411/GPL570  :", dim(gse3), "\n")
+
+gse1 <- clean_matrix(as.matrix(gse1))
+gse2 <- clean_matrix(as.matrix(gse2))
+gse3 <- clean_matrix(as.matrix(gse3))
+
+# ------------------------------------------------------------------------------
+# Conditional log2(x+1): only transform if the median is on the raw scale (>50)
+# ------------------------------------------------------------------------------
+safe_clean_and_log <- function(mat, name) {
+  if (!is.matrix(mat)) mat <- as.matrix(mat)
+
+  vals   <- as.numeric(mat)
+  vals   <- vals[!is.na(vals)]
+  if (length(vals) == 0) stop(paste(name, "contains no valid numeric data."))
+
+  med <- median(vals)
+  cat(name, "median =", round(med, 2), "\n")
+
+  if (med > 50) {
+    cat("  ", name, "appears untransformed; applying log2(x+1)...\n")
+    mat <- log2(mat + 1)
+  } else {
+    cat("  ", name, "assumed already log2-transformed; skipping.\n")
+  }
+  return(mat)
+}
+
+gse1f <- safe_clean_and_log(gse1, "GSE47460/GPL14550")
+gse2f <- safe_clean_and_log(gse2, "GSE47460/GPL6480")
+gse3f <- safe_clean_and_log(gse3, "GSE21411/GPL570")
+
+# ------------------------------------------------------------------------------
+# Retain only genes common to all three datasets
+# ------------------------------------------------------------------------------
+common_genes <- Reduce(intersect, list(rownames(gse1f), rownames(gse2f), rownames(gse3f)))
+cat("Genes common to all three datasets:", length(common_genes), "\n")
+
+# If few common genes remain, retry after uppercasing (case mismatch safeguard)
+if (length(common_genes) < 100) {
+  warning("Very few common genes; retrying after case normalisation.")
+  rownames(gse1f) <- toupper(rownames(gse1f))
+  rownames(gse2f) <- toupper(rownames(gse2f))
+  rownames(gse3f) <- toupper(rownames(gse3f))
+  common_genes <- Reduce(intersect, list(rownames(gse1f), rownames(gse2f), rownames(gse3f)))
+  cat("Common genes after uppercasing:", length(common_genes), "\n")
+}
+
+merged_expr <- cbind(gse1f[common_genes, ], gse2f[common_genes, ], gse3f[common_genes, ])
+cat("Final merged matrix:", dim(merged_expr), "\n")
+
+write.csv(merged_expr, "Merged_Expression_Matrix_Final.csv")
+saveRDS(merged_expr, "Merged_Expression_Matrix_Final.rds")
+cat("Saved: Merged_Expression_Matrix_Final.csv / .rds\n")
+
+
+##03_quality_control_plots.R
+# ==============================================================================
+# Pre-Batch-Correction Quality-Control Plots
+# ==============================================================================
+# Objective:
+#   Inspect median alignment (boxplot) and distributional overlap (density)
+#   across all samples before applying ComBat, to establish a baseline for
+#   assessing the effectiveness of batch correction.
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages(library(tidyverse))
+
+expr_matrix <- readRDS("Merged_Expression_Matrix_Final.rds")
+
+# Sanity check: report NA burden per sample
+na_pct <- colSums(is.na(expr_matrix)) / nrow(expr_matrix)
+if (any(na_pct > 0.5)) {
+  warning("Some samples exceed 50% NA values (possible column misalignment).")
+  print(sort(na_pct, decreasing = TRUE)[1:5])
+} else {
+  cat("NA burden acceptable; proceeding to QC plots.\n")
+}
+
+# Coerce to numeric matrix, forcing non-numeric debris (e.g., stray gene names)
+# to NA. Suppress the inevitable coercion warnings.
+expr_matrix <- suppressWarnings(
+  as.matrix(sapply(as.data.frame(expr_matrix), as.numeric))
+)
+
+# Apply log2(x+1) only if the data are clearly untransformed
+if (max(expr_matrix, na.rm = TRUE) > 100) {
+  cat("Applying log2(x+1) transformation.\n")
+  expr_matrix <- log2(expr_matrix + 1)
+}
+write.csv(expr_matrix, "Merged_Expression_Matrix_Final1.csv")
+
+# Two-panel QC layout: boxplot (top) + density overlay (bottom)
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+# (A) Boxplot: medians should align after successful normalisation
+boxplot(
+  expr_matrix,
+  main     = "Boxplot: Median Alignment Check",
+  xlab     = "Samples",
+  ylab     = "log2 Expression",
+  col      = "steelblue",
+  outline  = FALSE,
+  las      = 2,
+  cex.axis = 0.6
+)
+abline(h = median(expr_matrix, na.rm = TRUE), col = "red", lwd = 2, lty = 2)
+legend("topright", legend = "Global Median", col = "red", lwd = 2, lty = 2, bty = "n")
+
+# (B) Density plot: distributions should overlap across samples
+plot(
+  density(expr_matrix[, 1], na.rm = TRUE),
+  col = 1,
+  main = "Density Plot: Distributional Overlap",
+  xlab = "log2 Expression",
+  ylab = "Density"
+)
+for (i in seq_len(min(5, ncol(expr_matrix)))) {
+  lines(density(expr_matrix[, i], na.rm = TRUE), col = i)
+}
+legend("topright",
+       legend = paste("Sample", 1:min(5, ncol(expr_matrix))),
+       col    = seq_len(min(5, ncol(expr_matrix))),
+       lwd    = 2, cex = 0.8, bty = "n")
+
+par(mfrow = c(1, 1))
+saveRDS(expr_matrix, "expr_matrix_qc.rds")
+
+
+
+
+##04_metadata_alignment.R.
+# ==============================================================================
+# Sample Alignment Between Expression Matrix and Metadata
+# ==============================================================================
+# Objective:
+#   Ensure the column order and sample composition of the expression matrix
+#   exactly match the rows of the metadata table (containing Group and Batch
+#   labels). This is a prerequisite for correct model-matrix construction.
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages({
+  library(tidyverse)
+  library(readxl)
+})
+
+meta_data <- read_excel("metadata.csv.xlsx") %>%
+  mutate(across(everything(), ~ trimws(as.character(.x))))
+
+# Confirm the expected columns are present
+required_cols <- c("Sample_ID", "Group", "Batch")
+missing_cols   <- setdiff(required_cols, colnames(meta_data))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing columns in metadata:", paste(missing_cols, collapse = ", ")))
+}
+
+meta_data <- meta_data %>%
+  mutate(
+    Group = factor(Group, levels = c("CTRL", "ILD")),
+    Batch = factor(Batch)
+  )
+
+cat("Sample count per Batch x Group:\n")
+print(table(meta_data$Batch, meta_data$Group))
+
+# Load expression matrix and align to metadata
+expr_raw <- read.csv("Merged_Expression_Matrix_Final1.csv",
+                     row.names = 1, check.names = FALSE)
+expr_matrix <- as.matrix(expr_raw)
+
+wanted <- meta_data$Sample_ID
+found  <- wanted %in% colnames(expr_matrix)
+
+if (!all(found)) {
+  miss <- wanted[!found]
+  stop(paste0(
+    length(miss), " samples in metadata are absent from the expression matrix. ",
+    "Examples: ", paste(head(miss), collapse = ", ")
+  ))
+}
+cat("All metadata samples are present in the expression matrix.\n")
+
+# Subset and reorder columns to match metadata row order
+expr_aligned <- expr_matrix[, meta_data$Sample_ID, drop = FALSE]
+
+if (!all(colnames(expr_aligned) == meta_data$Sample_ID)) {
+  stop("Column order still does not match metadata; check Sample_ID for whitespace.")
+}
+cat("Sample order verified. Matrix dimensions:", dim(expr_aligned), "\n")
+
+# Persist the aligned objects for downstream scripts
+saveRDS(expr_aligned, "expr_aligned.rds")
+saveRDS(meta_data,    "meta_aligned.rds")
+
+
+##05_combat_batch.R
+# ==============================================================================
+# Batch Effect Removal with ComBat (sva) and Visual Evaluation
+# ==============================================================================
+# Objective:
+#   Apply empirical-Bayes ComBat to remove known batch effects (GSE x platform)
+#   while preserving the biological signal of interest (Group: CTRL vs ILD),
+#   then evaluate correction effectiveness via PCA and boxplot comparisons.
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages({
+  library(tidyverse)
+  library(sva)
+  library(ggplot2)
+  library(gridExtra)
+  library(RColorBrewer)
+})
+
+expr_aligned <- readRDS("expr_aligned.rds")
+meta_data    <- readRDS("meta_aligned.rds")
+
+# ------------------------------------------------------------------------------
+# 1. Final alignment sanity check and model-matrix construction
+# ------------------------------------------------------------------------------
+if (!all(colnames(expr_aligned) == meta_data$Sample_ID)) {
+  stop("Expression-matrix columns and metadata rows are not aligned.")
+}
+cat("Sample alignment confirmed.\n")
+
+meta_data$Batch <- as.factor(meta_data$Batch)
+meta_data$Group <- as.factor(meta_data$Group)
+mod <- model.matrix(~ Group, data = meta_data)
+
+# ------------------------------------------------------------------------------
+# 2. Run ComBat (mod preserves the Group effect during batch removal)
+# ------------------------------------------------------------------------------
+combat_expr <- tryCatch(
+  ComBat(
+    dat        = expr_aligned,
+    batch      = meta_data$Batch,
+    mod        = mod,
+    par.prior  = TRUE,
+    prior.plots = FALSE
+  ),
+  error = function(e) {
+    message("ComBat failed: ", e$message)
+    message("Falling back to ComBat without a biological model (mod = NULL).")
+    ComBat(
+      dat         = expr_aligned,
+      batch       = meta_data$Batch,
+      mod         = NULL,
+      par.prior   = TRUE,
+      prior.plots = FALSE
+    )
+  }
+)
+cat("ComBat batch correction complete.\n")
+
+# ------------------------------------------------------------------------------
+# 3. Persist corrected data and a pre-correction copy for reproducibility
+# ------------------------------------------------------------------------------
+write.csv(combat_expr, "Merged_Expression_Matrix_ComBat_Corrected_Expr.csv")
+write.csv(expr_aligned, "Merged_Expression_Matrix_Before_ComBat.csv")
+write.csv(meta_data,    "Merged_Expression_Matrix_Metadata_Aligned.csv",
+          row.names = FALSE)
+saveRDS(combat_expr, "combat_expr.rds")
+
+# ------------------------------------------------------------------------------
+# 4. PCA evaluation (before vs after)
+# ------------------------------------------------------------------------------
+create_pca_plot <- function(mat, meta, title) {
+  pca <- prcomp(t(mat), scale. = TRUE)
+  pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+  df  <- data.frame(
+    PC1    = pca$x[, 1],
+    PC2    = pca$x[, 2],
+    Batch  = meta$Batch,
+    Group  = meta$Group
+  )
+  ggplot(df, aes(x = PC1, y = PC2, color = Batch)) +
+    geom_point(size = 3, alpha = 0.7) +
+    stat_ellipse(aes(group = Batch), linetype = 2, level = 0.95, show.legend = FALSE) +
+    labs(
+      title = title,
+      x     = paste0("PC1 (", pct[1], "%)"),
+      y     = paste0("PC2 (", pct[2], "%)")
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+}
+
+grid.arrange(
+  create_pca_plot(expr_aligned, meta_data, "Before ComBat"),
+  create_pca_plot(combat_expr,  meta_data, "After ComBat"),
+  ncol = 2
+)
+
+# ------------------------------------------------------------------------------
+# 5. Boxplot evaluation (before vs after)
+# ------------------------------------------------------------------------------
+unique_batches <- levels(meta_data$Batch)
+n_batches      <- length(unique_batches)
+palette_cols   <- brewer.pal(max(3, n_batches), "Set2")[seq_len(n_batches)]
+names(palette_cols) <- unique_batches
+
+create_boxplot <- function(mat, meta, title, palette) {
+  df <- as.data.frame(t(mat)) %>%
+    mutate(Sample_ID = rownames(.)) %>%
+    pivot_longer(cols = -Sample_ID, names_to = "Gene", values_to = "Expression") %>%
+    left_join(meta[, c("Sample_ID", "Batch")], by = "Sample_ID")
+
+  ggplot(df, aes(x = Sample_ID, y = Expression, fill = Batch)) +
+    geom_boxplot(aes(fill = Batch), outlier.size = 0.1, lwd = 0.1) +
+    scale_fill_manual(values = palette) +
+    labs(title = title, x = "Sample", y = "Expression (log2)") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+    )
+}
+
+grid.arrange(
+  create_boxplot(expr_aligned, meta_data, "Before ComBat", palette_cols),
+  create_boxplot(combat_expr,  meta_data, "After ComBat",  palette_cols),
+  ncol = 2
+)
+ggsave("Boxplot_ComBat_Comparison.png", width = 16, height = 6, dpi = 300)
+cat("Saved: Boxplot_ComBat_Comparison.png\n")
+
+##06_limma_deg.R
+# ==============================================================================
+# Differential Expression Analysis with limma (ILD vs CTRL)
+# ==============================================================================
+# Objective:
+#   Fit a linear model to the batch-corrected expression matrix, apply empirical
+#   Bayes moderation, extract DE genes (adj.P.Val < 0.05, |logFC| > 1), and
+#   generate a volcano plot plus a grouped heatmap of significant genes.
+# ==============================================================================
+
+rm(list = ls())
+suppressMessages({
+  library(limma)
+  library(tidyverse)
+  library(ggplot2)
+  library(pheatmap)
+})
+
+combat_expr <- readRDS("combat_expr.rds")
+meta_data   <- readRDS("meta_aligned.rds")
+
+# ------------------------------------------------------------------------------
+# 1. Design and contrast matrices
+# ------------------------------------------------------------------------------
+design <- model.matrix(~ Group, data = meta_data)
+colnames(design) <- c("Intercept", "ILD_vs_CTRL")
+cat("Design matrix:\n")
+print(head(design))
+print(table(meta_data$Group))
+
+contrast.matrix <- makeContrasts(ILD_vs_CTRL = ILD_vs_CTRL, levels = design)
+
+# ------------------------------------------------------------------------------
+# 2. Fit, contrast, and empirical-Bayes moderation
+# ------------------------------------------------------------------------------
+fit  <- lmFit(combat_expr, design)
+fit  <- contrasts.fit(fit, contrast.matrix)
+fit  <- eBayes(fit, trend = TRUE)
+
+deg_all <- topTable(
+  fit,
+  coef        = "ILD_vs_CTRL",
+  number      = Inf,
+  adjust.method = "BH",
+  sort.by     = "P"
+) %>%
+  tibble::rownames_to_column("Gene") %>%
+  mutate(change = case_when(
+    adj.P.Val < 0.05 & logFC >  1 ~ "Up",
+    adj.P.Val < 0.05 & logFC < -1 ~ "Down",
+    TRUE                            ~ "NotSig"
+  ))
+
+cat("DEG classification:\n")
+print(table(deg_all$change))
+
+write.csv(deg_all, "DEGs_ILD_vs_CTRL_limma_ComBat.csv", row.names = FALSE)
+saveRDS(deg_all, "deg_all.rds")
+cat("Saved: DEGs_ILD_vs_CTRL_limma_ComBat.csv\n")
+
+# ------------------------------------------------------------------------------
+# 3. Volcano plot
+# ------------------------------------------------------------------------------
+ggplot(deg_all, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(aes(color = change), size = 0.8, alpha = 0.7) +
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "NotSig" = "grey80")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(
+    title = "Volcano Plot: ILD vs CTRL",
+    x     = "log2 Fold Change",
+    y     = "-log10(P value)"
+  ) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave("VolcanoPlot_ILD_vs_CTRL.png", width = 7, height = 6, dpi = 300)
+
+# ------------------------------------------------------------------------------
+# 4. Heatmap of significant DE genes, grouped by sample phenotype
+# ------------------------------------------------------------------------------
+deg_sig <- deg_all %>% filter(adj.P.Val < 0.05, abs(logFC) > 1)
+
+if (nrow(deg_sig) > 0) {
+  expr_sig <- combat_expr[deg_sig$Gene, ]
+  scaled   <- t(scale(t(expr_sig)))
+
+  # Order samples by group to make the CTRL/ILD split legible
+  sample_order <- meta_data$Sample_ID[order(meta_data$Group)]
+  sample_order <- intersect(sample_order, colnames(scaled))
+  expr_sorted  <- scaled[, sample_order, drop = FALSE]
+
+  ann_col <- data.frame(Group = meta_data$Group[match(sample_order, meta_data$Sample_ID)])
+  rownames(ann_col) <- sample_order
+
+  ann_colors <- list(Group = c(CTRL = "#1B9E77", ILD = "#D95F02"))
+
+  pheatmap(
+    expr_sorted,
+    annotation_col    = ann_col,
+    annotation_colors = ann_colors,
+    show_rownames     = FALSE,
+    show_colnames     = FALSE,
+    scale             = "none",
+    cluster_cols      = FALSE,
+    cluster_rows      = TRUE,
+    clustering_method = "complete",
+    clustering_distance_rows = "euclidean",
+    color  = colorRampPalette(c("navy", "white", "firebrick"))(100),
+    main   = "Differentially Expressed Genes (Sorted by Group)",
+    border_color = NA,
+    cutree_rows  = 10
+  )
+  ggsave("Heatmap_DEGs_Sorted_By_Group.png", width = 8, height = 6, dpi = 300)
+} else {
+  message("No significant DE genes detected; relax thresholds if appropriate.")
+}
+
+
+##07_boruta_lasso.R
+# ==============================================================================
+# Boruta Feature Selection with Bootstrap Stability Validation
+# ==============================================================================
+# Objective:
+#   Use the all-relevant feature-selection algorithm Boruta to identify genes
+#   that discriminate ILD from CTRL, validate selection stability by
+#   bootstrapping (100 resamples), cross-check against limma DE signals and
+#   Random-Forest importance, and export a curated target list for downstream
+#   docking / network-pharmacology analysis.
+# ==============================================================================
+
+rm(list = ls()); gc()
+suppressMessages({
+  library(Boruta)
+  library(randomForest)
+  library(limma)
+  library(tidyverse)
+  library(sva)
+  library(pheatmap)
+})
+
+# ------------------------------------------------------------------------------
+# 1. Load data and encode experimental factors
+# ------------------------------------------------------------------------------
+# Expected columns (adjust the index range to match your file):
+#   1 = Sample_ID, 2 = Batch, 3 = Group, 4+ = gene expression
+df <- read.csv("Boruta_Intersection_targets.xlsx")
+batch <- df$Batch
+y     <- factor(df$Group)
+
+x <- df[, -(1:3)] %>% as.data.frame() %>% mutate(across(everything(), as.numeric))
+
+cat("Batch x Group table:\n")
+print(table(batch, y))
+
+# ------------------------------------------------------------------------------
+# 2. ComBat correction (modelled on the phenotype of interest)
+# ------------------------------------------------------------------------------
+design <- model.matrix(~ y)
+x_batch <- as.data.frame(t(ComBat(
+  dat         = t(x),
+  batch       = batch,
+  mod         = design,
+  par.prior   = TRUE,
+  prior.plots = FALSE
+)))
+
+# ------------------------------------------------------------------------------
+# 3. Boruta all-relevant selection
+# ------------------------------------------------------------------------------
+boruta_data <- cbind(x_batch, y = y)
+set.seed(123)
+
+boruta_result <- Boruta(
+  y  ~ .,
+  data      = boruta_data,
+  doTrace   = 0,
+  maxRuns   = 300,
+  holdHistory = TRUE
+)
+print(boruta_result)
+
+# Native importance-history plot (green = confirmed, red = rejected, blue = shadow)
+plot(boruta_result,
+     sort           = TRUE,
+     whichShadow    = c(TRUE, TRUE, TRUE),
+     xlab           = "Genes",
+     ylab           = "Importance (Z-score)",
+     main           = "Boruta Feature Selection History")
+
+save(boruta_result, x_batch, batch, y, file = "Boruta_Result.RData")
+
+# ------------------------------------------------------------------------------
+# 4. Bootstrap stability assessment (100 resamples)
+# ------------------------------------------------------------------------------
+genes      <- colnames(x_batch)
+n_rep      <- 100
+stable_mat <- matrix(0, nrow = n_rep, ncol = length(genes))
+colnames(stable_mat) <- genes
+
+pb <- txtProgressBar(min = 0, max = n_rep, style = 3)
+for (i in seq_len(n_rep)) {
+  idx <- sample(seq_len(nrow(x_batch)), replace = TRUE)
+  tmp <- Boruta(
+    x       = x_batch[idx, , drop = FALSE],
+    y       = y[idx],
+    maxRuns = 100,
+    doTrace = 0
+  )
+  sel <- getSelectedAttributes(tmp, withTentative = FALSE)
+  stable_mat[i, sel] <- 1
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+stability_rate <- colMeans(stable_mat)
+stable_genes   <- names(stability_rate)[stability_rate >= 0.8]
+cat("Genes with stability >= 80%:", length(stable_genes), "\n")
+
+# ------------------------------------------------------------------------------
+# 5. Cross-validation against limma and Random Forest
+# ------------------------------------------------------------------------------
+# limma DE
+x_limma <- t(x_batch)
+design  <- model.matrix(~ y)
+fit     <- eBayes(lmFit(x_limma, design))
+deg     <- topTable(fit, coef = 2, number = Inf, adjust.method = "fdr")
+
+# Random Forest importance
+rf     <- randomForest(x = x_batch[, stable_genes, drop = FALSE], y = y, importance = TRUE)
+rf_imp <- importance(rf, type = 1)
+
+# ------------------------------------------------------------------------------
+# 6. Export the curated target table
+# ------------------------------------------------------------------------------
+final_targets <- data.frame(
+  Gene             = stable_genes,
+  Boruta_Stability = round(stability_rate[stable_genes], 3),
+  Log2FC           = round(deg[stable_genes, "logFC"], 3),
+  FDR              = formatC(deg[stable_genes, "adj.P.Val"], format = "e", digits = 2),
+  RF_Importance    = round(rf_imp[stable_genes, 1], 3)
+) %>%
+  arrange(FDR, desc(Boruta_Stability))
+
+write.csv(final_targets, "Table_S1_Boruta_DEG_RF.csv", row.names = FALSE)
+
+# Confirmed-attribute export
+confirmed_genes <- getSelectedAttributes(boruta_result, withTentative = FALSE)
+write.csv(
+  data.frame(Gene = confirmed_genes),
+  file      = "Boruta_Confirmed_Genes.csv",
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# 7. Stability bar plot, quadrant plot, and RF-importance plot
+# ------------------------------------------------------------------------------
+stable_df <- data.frame(
+  Gene      = names(stability_rate[stable_genes]),
+  Stability = stability_rate[stable_genes]
+) %>% arrange(Stability)
+
+ggplot(stable_df, aes(x = reorder(Gene, Stability), y = Stability)) +
+  geom_bar(stat = "identity", fill = "#2E86AB") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Boruta Feature Stability (Bootstrap 100x)", x = "", y = "Selection Frequency")
+
+boruta_deg <- data.frame(
+  Gene      = names(stability_rate),
+  Stability = stability_rate,
+  FDR       = pmax(deg[names(stability_rate), "adj.P.Val"], 1e-300)
+) %>%
+  mutate(Boruta = Stability >= 0.8)
+
+ggplot(boruta_deg, aes(x = -log10(FDR), y = Stability, color = Boruta)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c("grey60" = "grey60", "TRUE" = "#D81159")) +
+  theme_minimal() +
+  labs(title = "Boruta Stability vs limma DE Significance", x = "-log10(FDR)", y = "Selection Frequency")
+
+rf_df <- data.frame(
+  Gene       = rownames(rf_imp),
+  Importance = rf_imp[, 1]
+) %>% arrange(desc(Importance))
+
+ggplot(rf_df, aes(x = reorder(Gene, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#E69F00") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Random Forest Variable Importance")
+
+# ------------------------------------------------------------------------------
+# 8. Heatmap of stable targets (colour palette auto-adapts to group levels)
+# ------------------------------------------------------------------------------
+expr_mat <- t(x_batch[, stable_genes])
+expr_mat <- t(scale(t(expr_mat)))
+
+annotation_col <- data.frame(Group = y, row.names = colnames(expr_mat))
+
+unique_groups <- unique(as.character(y))
+group_palette <- setNames(
+  c("#2E86AB", "#D81159", "#E69F00", "#009E73")[seq_along(unique_groups)],
+  unique_groups
+)
+
+pheatmap(
+  expr_mat,
+  color         = colorRampPalette(c("navy", "white", "firebrick"))(100),
+  annotation_col    = annotation_col,
+  annotation_colors = list(Group = group_palette),
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  fontsize_row      = 6,
+  clustering_method = "complete",
+  cluster_cols      = TRUE,
+  main = "Expression Heatmap of Stable Targets"
+)
+
+# ------------------------------------------------------------------------------
+# 9. Persist inputs for downstream LASSO / docking workflow
+# ------------------------------------------------------------------------------
+saveRDS(
+  list(x_batch = x_batch, stable_genes = stable_genes, y = y, batch = batch),
+  "Lasso_Input.RDS"
+)
+cat("Saved: Table_S1_Boruta_DEG_RF.csv, Boruta_Confirmed_Genes.csv, Lasso_Input.RDS\n")
+
+
