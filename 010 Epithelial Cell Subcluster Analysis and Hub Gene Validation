@@ -1,0 +1,312 @@
+# ==============================================================================
+# Epithelial Cell Subcluster Analysis and Hub Gene Validation
+# ==============================================================================
+# Title: Subpopulation Profiling of Epithelial Cells and Hub Gene Expression
+#        in ILD vs. Donor scRNA-seq Data
+#
+# Description:
+#   This script extracts epithelial cells from the annotated Seurat object,
+#   performs unsupervised subclustering, assigns subtype labels (SAEC, AT1,
+#   AT2, BATEC, IREC, MSEC, CC, CEC, SEC, MLEC), removes contaminating
+#   clusters, evaluates subcluster composition between ILD and Donor conditions,
+#   and visualizes hub gene expression across epithelial subtypes.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# Create output directories
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+# --------------------- Section 2: Load Annotated Seurat Object --------------
+scRNA <- readRDS("05_Lung_Donor_vs_ILD.rds")
+
+# Define hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Inspect available cell type labels
+unique(scRNA$celltype_abbr)
+
+# --------------------- Section 3: Extract Epithelial Cells --------------------
+# Subset epithelial cells based on predefined cell type abbreviations
+epi <- subset(scRNA, celltype_abbr %in% c(
+  "AT2", "BSEC", "SEC", "Club", "AT1",
+  "ASEC", "SecEpi", "CilEpi", "Basal"
+))
+
+cat("Number of epithelial cells:", ncol(epi), "\n")
+table(epi$celltype_abbr)
+
+# --------------------- Section 4: Subclustering of Epithelial Cells ----------
+epi <- FindVariableFeatures(epi, nfeatures = 2000)
+epi <- ScaleData(epi)
+epi <- RunPCA(epi, npcs = 30)
+epi <- FindNeighbors(epi, dims = 1:20)
+epi <- FindClusters(epi, resolution = 0.3)
+epi <- RunUMAP(epi, dims = 1:20)
+
+# Visualize raw subclusters
+DimPlot(epi, reduction = "umap", label = TRUE) +
+  ggtitle("Epithelial Cell Re-clustering")
+
+ggsave("figures/Epi_Reclustering_RawUMAP.pdf", width = 7, height = 6)
+
+# Feature plots for hub genes
+p_feature_all <- FeaturePlot(epi, features = hub_genes, reduction = "umap", ncol = 2)
+ggsave(
+  "figures/Epi_FeaturePlot_Markers.pdf",
+  plot   = p_feature_all,
+  width  = 10,
+  height = 8
+)
+
+# --------------------- Section 5: Marker Gene Identification ----------------
+epi_markers <- FindAllMarkers(
+  epi,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+# Export top 10 markers per subcluster
+epi_top10 <- epi_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10)
+
+write.csv(
+  epi_top10,
+  "Epi_cluster_top10_markers_raw.csv",
+  row.names = FALSE
+)
+
+# --------------------- Section 6: Manual Subcluster Annotation ---------------
+# Map Seurat cluster IDs to biologically meaningful epithelial subtypes
+epi$subcluster <- factor(
+  case_when(
+    epi$seurat_clusters == "0"  ~ "SAEC",
+    epi$seurat_clusters == "1"  ~ "AT1",
+    epi$seurat_clusters == "2"  ~ "AT2",
+    epi$seurat_clusters == "3"  ~ "BATEC",
+    epi$seurat_clusters == "4"  ~ "IREC",
+    epi$seurat_clusters == "5"  ~ "MSEC",
+    epi$seurat_clusters == "6"  ~ "CC",
+    epi$seurat_clusters == "8"  ~ "CEC",
+    epi$seurat_clusters == "9"  ~ "SEC",
+    epi$seurat_clusters == "12" ~ "MLEC",
+    TRUE                         ~ NA_character_   # Clusters 7, 10, 11, 13 = contaminants
+  ),
+  levels = c(
+    "SAEC", "AT1", "AT2", "BATEC", "IREC",
+    "MSEC", "CC", "CEC", "SEC", "MLEC"
+  )
+)
+
+cat("Number of unannotated (NA) cells:", sum(is.na(epi$subcluster)), "\n")
+table(epi$subcluster, useNA = "ifany")
+
+# --------------------- Section 7: Remove Contaminating Clusters --------------
+epi_clean <- subset(epi, subset = !is.na(subcluster))
+epi_clean$subcluster <- droplevels(epi_clean$subcluster)
+
+# Re-run dimensionality reduction on cleaned object
+epi_clean <- RunPCA(epi_clean, npcs = 30)
+epi_clean <- RunUMAP(epi_clean, dims = 1:20)
+
+# Save clean UMAP plot
+DimPlot(
+  epi_clean,
+  reduction = "umap",
+  group.by  = "subcluster",
+  label     = TRUE,
+  repel     = TRUE
+) + ggtitle("Clean Epithelial Cell Subclusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave("figures/Epi_Clean_UMAP.pdf", width = 7, height = 6)
+
+# --------------------- Section 8: Inherit Clinical Group Labels --------------
+epi_clean$condition <- scRNA$Group[Cells(epi_clean)]
+
+table(epi_clean$subcluster, epi_clean$condition)
+
+# --------------------- Section 9: Proportion Plot (ILD vs. Donor) ------------
+df_epi <- as.data.frame(table(
+  Condition  = epi_clean$condition,
+  Subcluster = epi_clean$subcluster
+))
+
+p_prop <- ggplot(df_epi, aes(x = Condition, y = Freq, fill = Subcluster)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  labs(
+    title = "Epithelial Cell Subcluster Composition in ILD vs. Donor",
+    x     = "Condition",
+    y     = "Fraction of Epithelial Cells"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+ggsave(
+  "figures/Epi_Subcluster_Proportion_ILD_vs_Donor.pdf",
+  plot   = p_prop,
+  width  = 7,
+  height = 5
+)
+
+# --------------------- Section 10: Faceted UMAP by Condition -----------------
+umap_coords <- Embeddings(epi_clean, reduction = "umap")
+plot_df <- data.frame(
+  UMAP_1     = umap_coords[, 1],
+  UMAP_2     = umap_coords[, 2],
+  subcluster = epi_clean$subcluster,
+  condition  = epi_clean$condition
+)
+
+p_umap_facet <- ggplot(
+  plot_df,
+  aes(x = UMAP_1, y = UMAP_2, color = subcluster)
+) +
+  geom_point(size = 0.3, alpha = 0.85) +
+  facet_wrap(~ condition, nrow = 1) +
+  ggtitle("Epithelial Subclusters in ILD vs. Donor") +
+  theme_classic() +
+  theme(
+    legend.title  = element_blank(),
+    axis.text     = element_blank(),
+    axis.ticks    = element_blank(),
+    panel.border  = element_rect(color = "black", fill = NA)
+  )
+
+ggsave(
+  "figures/Epi_UMAP_Faceted_Condition.pdf",
+  plot   = p_umap_facet,
+  width  = 10,
+  height = 4
+)
+
+# --------------------- Section 11: Hub Gene Visualization --------------------
+Idents(epi_clean) <- "subcluster"
+
+# Downsample cells per subcluster for heatmap (max 1000 per cluster)
+set.seed(123)
+cells_sampled <- lapply(levels(epi_clean$subcluster), function(cl) {
+  cells <- WhichCells(epi_clean, expression = subcluster == cl)
+  n_sample <- min(length(cells), 1000)
+  sample(cells, n_sample)
+})
+cells_use <- unlist(cells_sampled)
+
+# Heatmap of hub gene expression
+p_heatmap <- DoHeatmap(
+  epi_clean,
+  cells    = cells_use,
+  features = hub_genes,
+  group.by = "subcluster",
+  slot     = "data",
+  size     = 4,
+  raster   = FALSE
+) +
+  scale_fill_gradient2(
+    low      = "blue",
+    mid      = "white",
+    high     = "red",
+    midpoint = 2.5
+  ) +
+  ggtitle("Hub Gene Expression in Epithelial Subclusters")
+
+print(p_heatmap)
+
+# Violin plots for selected hub genes
+p_violin <- VlnPlot(
+  epi_clean,
+  features = c("EGFR", "VEGFA"),
+  group.by = "subcluster",
+  pt.size  = 0,
+  ncol     = 2
+) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_violin)
+
+# Feature plots on UMAP
+p_feature_hub <- FeaturePlot(
+  epi_clean,
+  features = c("EGFR", "VEGFA"),
+  reduction = "umap",
+  pt.size   = 0.5,
+  order     = TRUE
+) +
+  theme(legend.position = "right")
+
+print(p_feature_hub)
+
+# Dot plot for all hub genes
+valid_hub_genes <- intersect(hub_genes, rownames(epi_clean))
+if (length(valid_hub_genes) < length(hub_genes)) {
+  cat("Warning: genes not found in epi_clean:",
+      setdiff(hub_genes, valid_hub_genes), "\n")
+}
+
+p_dot <- DotPlot(
+  object   = epi_clean,
+  features = valid_hub_genes,
+  cols     = c("lightgrey", "red"),
+  dot.scale = 6
+) +
+  scale_color_gradient2(
+    low       = "lightgrey",
+    mid       = "white",
+    high      = "red",
+    midpoint  = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y  = element_text(size = 10),
+    plot.title   = element_text(hjust = 0.5)
+  ) +
+  ggtitle("Hub Gene Expression in Epithelial Subclusters")
+
+ggsave("Epi_HubGenes_DotPlot.pdf", p_dot, width = 10, height = 6)
+
+# --------------------- Section 12: Save Results -----------------------------
+epi_final <- epi_clean
+saveRDS(epi_final, file = "05_Epi_Cells_Final.rds")
+
+# Write subcluster annotations back to the main Seurat object
+scRNA$epi_subcluster <- NA
+scRNA$epi_subcluster[Cells(epi_final)] <- epi_final$subcluster
+scRNA$epi_condition <- NA
+scRNA$epi_condition[Cells(epi_final)] <- epi_final$condition
+
+saveRDS(scRNA, file = "05_Lung_Donor_vs_ILD.rds")
+
+# Verify integration
+table(scRNA$epi_subcluster, useNA = "ifany")
+table(scRNA$epi_condition, useNA = "ifany")
+
+# Export annotation mapping and marker table
+write.csv(
+  data.frame(
+    seurat_cluster = 0:9,
+    subcluster     = levels(epi_clean$subcluster)
+  ),
+  "Epi_Cluster_Annotation.csv",
+  row.names = FALSE
+)
+
+write.csv(epi_markers, "Epi_Subcluster_Markers.csv", row.names = FALSE)
+
+cat("Epithelial cell subcluster analysis complete. All outputs saved.\n")
