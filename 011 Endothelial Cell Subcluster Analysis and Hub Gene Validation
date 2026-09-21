@@ -1,0 +1,293 @@
+# ==============================================================================
+# Endothelial Cell Subcluster Analysis and Hub Gene Validation
+# ==============================================================================
+# Title: Subpopulation Profiling of Endothelial Cells and Hub Gene Expression
+#        in ILD vs. Donor scRNA-seq Data
+#
+# Description:
+#   This script extracts endothelial cells from the annotated Seurat object,
+#   performs unsupervised subclustering, assigns subtype labels (CapEC, VenEC,
+#   CapEC-II, ArtEC, laEC, SaEC, MLEC, LEC), removes contaminating clusters,
+#   evaluates subcluster composition between ILD and Donor conditions, and
+#   visualizes hub gene expression across endothelial subtypes.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# Create output directories
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+# --------------------- Section 2: Load Annotated Seurat Object --------------
+scRNA <- readRDS("05_Lung_Donor_vs_ILD.rds")
+
+# Define hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# --------------------- Section 3: Extract Endothelial Cells ------------------
+# Subset endothelial cells based on predefined cell type abbreviations
+Endo <- subset(scRNA, celltype_abbr %in% c("Cap. EC", "LEC"))
+
+cat("Number of endothelial cells:", ncol(Endo), "\n")
+table(Endo$celltype_abbr)
+
+# --------------------- Section 4: Subclustering of Endothelial Cells ---------
+Endo <- FindVariableFeatures(Endo, nfeatures = 2000)
+Endo <- ScaleData(Endo)
+Endo <- RunPCA(Endo, npcs = 30)
+Endo <- FindNeighbors(Endo, dims = 1:20)
+Endo <- FindClusters(Endo, resolution = 0.3)
+Endo <- RunUMAP(Endo, dims = 1:20)
+
+# Visualize raw subclusters
+p_raw <- DimPlot(Endo, reduction = "umap", label = TRUE) +
+  ggtitle("Endothelial Cell Re-clustering")
+ggsave("figures/Endo_Reclustering_RawUMAP.pdf", plot = p_raw, width = 7, height = 6)
+
+# Feature plots for hub genes
+p_feat <- FeaturePlot(Endo, features = hub_genes, reduction = "umap", ncol = 2)
+ggsave("figures/Endo_FeaturePlot_Markers.pdf", plot = p_feat, width = 10, height = 8)
+
+# --------------------- Section 5: Marker Gene Identification -----------------
+Endo_markers <- FindAllMarkers(
+  Endo,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+# Export top 10 markers per subcluster
+Endo_top10 <- Endo_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10)
+
+write.csv(Endo_top10, "Endo_cluster_top10_markers_raw.csv", row.names = FALSE)
+
+# --------------------- Section 6: Manual Subcluster Annotation ---------------
+# Map Seurat cluster IDs to biologically meaningful endothelial subtypes
+Endo$subcluster <- factor(
+  case_when(
+    Endo$seurat_clusters == "0" ~ "CapEC",
+    Endo$seurat_clusters == "1" ~ "VenEC",
+    Endo$seurat_clusters == "2" ~ "CapEC-II",
+    Endo$seurat_clusters == "3" ~ "ArtEC",
+    Endo$seurat_clusters == "4" ~ "laEC",
+    Endo$seurat_clusters == "5" ~ "SaEC",
+    Endo$seurat_clusters == "7" ~ "MLEC",
+    Endo$seurat_clusters == "9" ~ "LEC",
+    TRUE                        ~ NA_character_  # Clusters 6, 8, 10 = contaminants
+  ),
+  levels = c("CapEC", "VenEC", "CapEC-II", "ArtEC", "laEC", "SaEC", "MLEC", "LEC")
+)
+
+cat("Number of unannotated (NA) cells:", sum(is.na(Endo$subcluster)), "\n")
+table(Endo$subcluster, useNA = "ifany")
+
+# --------------------- Section 7: Remove Contaminating Clusters --------------
+Endo_clean <- subset(Endo, subset = !is.na(subcluster))
+Endo_clean$subcluster <- droplevels(Endo_clean$subcluster)
+
+# Re-run dimensionality reduction on cleaned object
+Endo_clean <- RunPCA(Endo_clean, npcs = 30)
+Endo_clean <- RunUMAP(Endo_clean, dims = 1:20)
+
+# Save clean UMAP plot
+p_clean <- DimPlot(
+  Endo_clean,
+  reduction  = "umap",
+  group.by   = "subcluster",
+  label      = TRUE,
+  repel      = TRUE
+) + ggtitle("Clean Endothelial Cell Subclusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave("figures/Endo_Clean_UMAP.pdf", plot = p_clean, width = 7, height = 6)
+
+# --------------------- Section 8: Inherit Clinical Group Labels --------------
+Endo_clean$condition <- scRNA$Group[Cells(Endo_clean)]
+
+table(Endo_clean$subcluster, Endo_clean$condition)
+
+# --------------------- Section 9: Proportion Plot (ILD vs. Donor) ------------
+df_Endo <- as.data.frame(table(
+  Condition  = Endo_clean$condition,
+  Subcluster = Endo_clean$subcluster
+))
+
+p_prop <- ggplot(df_Endo, aes(x = Condition, y = Freq, fill = Subcluster)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  labs(
+    title = "Endothelial Cell Subcluster Composition in ILD vs. Donor",
+    x     = "Condition",
+    y     = "Fraction of Endothelial Cells"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+ggsave(
+  "figures/Endo_Subcluster_Proportion_ILD_vs_Donor.pdf",
+  plot   = p_prop,
+  width  = 7,
+  height = 5
+)
+
+# --------------------- Section 10: Faceted UMAP by Condition -----------------
+umap_coords <- Embeddings(Endo_clean, reduction = "umap")
+plot_df <- data.frame(
+  UMAP_1     = umap_coords[, 1],
+  UMAP_2     = umap_coords[, 2],
+  subcluster = Endo_clean$subcluster,
+  condition  = Endo_clean$condition
+)
+
+p_umap_facet <- ggplot(
+  plot_df,
+  aes(x = UMAP_1, y = UMAP_2, color = subcluster)
+) +
+  geom_point(size = 0.3, alpha = 0.85) +
+  facet_wrap(~ condition, nrow = 1) +
+  ggtitle("Endothelial Subclusters in ILD vs. Donor") +
+  theme_classic() +
+  theme(
+    legend.title  = element_blank(),
+    axis.text     = element_blank(),
+    axis.ticks    = element_blank(),
+    panel.border  = element_rect(color = "black", fill = NA)
+  )
+
+ggsave(
+  "figures/Endo_UMAP_Faceted_Condition.pdf",
+  plot   = p_umap_facet,
+  width  = 10,
+  height = 4
+)
+
+# --------------------- Section 11: Hub Gene Visualization --------------------
+Idents(Endo_clean) <- "subcluster"
+
+# Downsample cells per subcluster for heatmap (max 50 per cluster)
+set.seed(123)
+cells_sampled <- lapply(levels(Endo_clean$subcluster), function(cl) {
+  cells <- WhichCells(Endo_clean, expression = subcluster == cl)
+  n_sample <- min(length(cells), 50)
+  sample(cells, n_sample)
+})
+cells_use <- unlist(cells_sampled)
+
+# Heatmap of hub gene expression
+p_heatmap <- DoHeatmap(
+  Endo_clean,
+  cells    = cells_use,
+  features = hub_genes,
+  group.by = "subcluster",
+  slot     = "data",
+  size     = 4,
+  raster   = FALSE
+) +
+  scale_fill_gradient2(
+    low      = "blue",
+    mid      = "white",
+    high     = "red",
+    midpoint = 2.5
+  ) +
+  ggtitle("Hub Gene Expression in Endothelial Subclusters")
+
+print(p_heatmap)
+
+# Violin plots for selected hub genes
+p_violin <- VlnPlot(
+  Endo_clean,
+  features  = c("EGFR", "IL6", "VEGFA", "SERPINE1"),
+  group.by  = "subcluster",
+  pt.size   = 0,
+  ncol      = 2
+) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_violin)
+
+# Feature plots on UMAP
+p_feature <- FeaturePlot(
+  Endo_clean,
+  features  = c("EGFR", "IL6", "VEGFA", "SERPINE1"),
+  reduction = "umap",
+  pt.size   = 0.5,
+  order     = TRUE
+) +
+  theme(legend.position = "right")
+
+print(p_feature)
+
+# Dot plot for all hub genes
+valid_hub_genes <- intersect(hub_genes, rownames(Endo_clean))
+if (length(valid_hub_genes) < length(hub_genes)) {
+  cat("Warning: genes not found in Endo_clean:",
+      setdiff(hub_genes, valid_hub_genes), "\n")
+}
+
+p_dot <- DotPlot(
+  object   = Endo_clean,
+  features = valid_hub_genes,
+  cols     = c("lightgrey", "red"),
+  dot.scale = 6
+) +
+  scale_color_gradient2(
+    low       = "lightgrey",
+    mid       = "white",
+    high      = "red",
+    midpoint  = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y  = element_text(size = 10),
+    plot.title   = element_text(hjust = 0.5)
+  ) +
+  ggtitle("Hub Gene Expression in Endothelial Subclusters")
+
+ggsave("Endo_HubGenes_DotPlot.pdf", p_dot, width = 10, height = 6)
+
+# --------------------- Section 12: Save Results -----------------------------
+Endo_final <- Endo_clean
+
+# Write subcluster annotations back to the main Seurat object
+scRNA$Endo_subcluster <- NA
+scRNA$Endo_subcluster[Cells(Endo_final)] <- Endo_final$subcluster
+scRNA$Endo_condition <- NA
+scRNA$Endo_condition[Cells(Endo_final)] <- Endo_final$condition
+
+saveRDS(scRNA, file = "05_Lung_Donor_vs_ILD.rds")
+
+# Verify integration
+table(scRNA$Endo_subcluster, useNA = "ifany")
+table(scRNA$Endo_condition, useNA = "ifany")
+
+# Export annotation mapping and marker table
+write.csv(
+  data.frame(
+    seurat_cluster = 0:7,
+    subcluster     = levels(Endo_clean$subcluster)
+  ),
+  "Endo_Cluster_Annotation.csv",
+  row.names = FALSE
+)
+
+write.csv(Endo_markers, "Endo_Subcluster_Markers.csv", row.names = FALSE)
+
+# Save the standalone endothelial object
+saveRDS(Endo_clean, "06_Endo.rds")
+
+cat("Endothelial cell subcluster analysis complete. All outputs saved.\n")
