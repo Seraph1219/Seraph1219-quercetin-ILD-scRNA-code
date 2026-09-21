@@ -1,0 +1,389 @@
+# ==============================================================================
+# Cell-Cell Communication Analysis via CellChat
+# ==============================================================================
+# Title: Cell-Type-Specific Ligand-Receptor Mediated Communication in ILD
+#        and Hub Gene-Driven Signaling Networks
+#
+# Description:
+#   This script performs CellChat-based intercellular communication analysis
+#   using the fine-annotated Seurat object. It:
+#   1. Constructs CellChat objects for Donor and ILD conditions
+#   2. Identifies top signaling pathways in ILD
+#   3. Visualizes global and pathway-specific chord diagrams
+#   4. Extracts hub gene-mediated ligand-receptor interactions
+#   5. Exports hub gene communication tables for key target cells
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 0: Load Required Libraries ---------------------
+library(Seurat)
+library(CellChat)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+# --------------------- Section 1: Load Final Seurat Object --------------------
+scRNA <- readRDS("08_Lung_Donor_vs_ILD_Final.rds")
+
+# --------------------- Section 2: Build CellChat Metadata ---------------------
+meta <- data.frame(
+  cell      = colnames(scRNA),
+  celltype  = scRNA$celltype_fine_corrected,
+  condition = scRNA$Group,
+  stringsAsFactors = FALSE
+)
+rownames(meta) <- meta$cell
+meta$cell <- NULL
+
+# Define cell subtypes to retain
+keep_subtypes <- c(
+  "iFib", "ImmFib", "mFib",
+  "AM", "IM", "InfMac", "MtMac", "LAMac",
+  "SPP1+Mac", "IFNMac", "FibMac", "MetMac", "CTLMac", "MDM",
+  "VenEC", "ArtEC", "laEC", "SaEC", "MLEC", "LEC",
+  "CapEC-II", "Cap. EC", "BSEC",
+  "IREC", "AT1", "BATEC", "MSEC",
+  "CC", "CEC", "SEC", "ASEC", "Club ", "SecEpi", "CilEpi",
+  "DC",
+  "B", "B cell", "Plasma"
+)
+
+meta <- meta[meta$celltype %in% keep_subtypes, ]
+
+# --------------------- Section 3: Define Cell Type Ordering -------------------
+# Order determines adjacency in chord diagrams (grouped by major lineage)
+group_order <- c(
+  # Macrophage
+  "AM", "IM", "InfMac", "MtMac", "LAMac",
+  "SPP1+Mac", "IFNMac", "FibMac", "MetMac", "CTLMac", "MDM",
+  # Fibroblast
+  "iFib", "ImmFib", "mFib",
+  # Endothelium
+  "VenEC", "ArtEC", "laEC", "SaEC", "MLEC", "LEC",
+  "CapEC-II", "Cap. EC", "BSEC",
+  # Epithelium
+  "AT1", "IREC", "BATEC", "MSEC",
+  "CC", "CEC", "SEC", "ASEC", "Club ", "SecEpi", "CilEpi",
+  # Mono / DC
+  "DC",
+  # B / Plasma
+  "B", "B cell", "Plasma"
+)
+
+group_order <- group_order[group_order %in% meta$celltype]
+meta$celltype  <- factor(meta$celltype, levels = group_order)
+meta$condition <- factor(meta$condition)
+
+cat("Cell type distribution:\n")
+print(table(meta$celltype))
+cat("Condition distribution:\n")
+print(table(meta$condition))
+
+# --------------------- Section 4: Extract Expression Matrix -------------------
+expr <- GetAssayData(scRNA, assay = "RNA", layer = "data")
+expr <- expr[, rownames(meta), drop = FALSE]
+
+# --------------------- Section 5: Build CellChat Objects by Condition ---------
+conds <- unique(meta$condition)
+conds <- conds[!is.na(conds)]
+conds <- trimws(conds)
+
+cellchat_list <- lapply(conds, function(cond) {
+
+  cat("\n==============================\n")
+  cat("Processing:", cond, "\n")
+
+  idx <- meta$condition == cond
+  meta_sub  <- meta[idx, , drop = FALSE]
+  expr_sub  <- expr[, idx, drop = FALSE]
+
+  if (nrow(meta_sub) == 0 || ncol(expr_sub) == 0) {
+    cat("  No cells found for", cond, "- skipping\n")
+    return(NULL)
+  }
+
+  # Re-level celltype factor for this subset
+  meta_sub$celltype <- factor(
+    meta_sub$celltype,
+    levels = group_order[group_order %in% meta_sub$celltype]
+  )
+
+  print(table(meta_sub$celltype))
+  colnames(expr_sub) <- rownames(meta_sub)
+
+  cc <- createCellChat(
+    object   = expr_sub,
+    meta     = meta_sub,
+    group.by = "celltype"
+  )
+
+  cc@DB <- CellChatDB.human
+
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc)
+  cc <- filterCommunication(cc, min.cells = 10)
+
+  cat("  Done:", cond, "\n")
+  return(cc)
+})
+
+cellchat_list <- Filter(Negate(is.null), cellchat_list)
+names(cellchat_list) <- conds
+
+# --------------------- Section 6: Define Lineage Color Scheme ------------------
+# Cells of the same major lineage share the same color
+group_colors <- c(
+  # Macrophage (red)
+  "AM" = "#E41A1C", "IM" = "#E41A1C", "InfMac" = "#E41A1C",
+  "MtMac" = "#E41A1C", "LAMac" = "#E41A1C", "SPP1+Mac" = "#E41A1C",
+  "IFNMac" = "#E41A1C", "FibMac" = "#E41A1C", "MetMac" = "#E41A1C",
+  "CTLMac" = "#E41A1C", "MDM" = "#E41A1C",
+  # Fibroblast (yellow)
+  "iFib" = "#FFD92F", "ImmFib" = "#FFD92F", "mFib" = "#FFD92F",
+  # Endothelium (green)
+  "VenEC" = "#4DAF4A", "ArtEC" = "#4DAF4A", "laEC" = "#4DAF4A",
+  "SaEC" = "#4DAF4A", "MLEC" = "#4DAF4A", "LEC" = "#4DAF4A",
+  "CapEC-II" = "#4DAF4A", "Cap. EC" = "#4DAF4A", "BSEC" = "#4DAF4A",
+  # Epithelium (blue)
+  "AT1" = "#377EB8", "IREC" = "#377EB8", "BATEC" = "#377EB8",
+  "MSEC" = "#377EB8", "CC" = "#377EB8", "CEC" = "#377EB8",
+  "SEC" = "#377EB8", "ASEC" = "#377EB8", "Club " = "#377EB8",
+  "SecEpi" = "#377EB8", "CilEpi" = "#377EB8",
+  # DC (purple)
+  "DC" = "#984EA3",
+  # B / Plasma (brown)
+  "B" = "#A65628", "B cell" = "#A65628", "Plasma" = "#A65628"
+)
+
+# --------------------- Section 7: Top Pathways in ILD ------------------------
+comm_ild <- subsetCommunication(cellchat_list[["ILD"]])
+
+top_pathways <- comm_ild %>%
+  arrange(desc(prob)) %>%
+  pull(pathway_name) %>%
+  unique() %>%
+  head(5)
+
+# --------------------- Section 8: Chord Diagram — Top Pathways ----------------
+pdf(
+  "Figure_CellChat_Chord_ILD_TopPathways_Subtypes.pdf",
+  width  = 11,
+  height = 11
+)
+netVisual_aggregate(
+  cellchat_list[["ILD"]],
+  signaling     = top_pathways,
+  layout        = "chord",
+  label.size    = 3.3,
+  edge.width.max = 10,
+  color.use     = group_colors,
+  title.name    = "Top signaling pathways in ILD (subtypes)"
+)
+dev.off()
+
+# Single-pathway chord diagrams for key ILD pathways
+for (pw in c("APP", "PECAM1", "FN1", "CCL", "ApoE")) {
+  netVisual_aggregate(
+    cellchat_list[["ILD"]],
+    signaling  = pw,
+    layout     = "chord",
+    title.name = paste(pw, "signaling in ILD")
+  )
+}
+
+# --------------------- Section 9: Hub Gene-Mediated LR Extraction -------------
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6",
+  "VEGFA", "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Query CellChatDB for hub gene-containing interactions
+db <- CellChatDB.human$interaction
+
+hub_lr_db <- db %>%
+  filter(
+    grepl(paste(hub_genes, collapse = "|"), ligand.symbol) |
+      grepl(paste(hub_genes, collapse = "|"), receptor.symbol)
+  )
+
+cat("Hub gene-containing LR pairs in database:", nrow(hub_lr_db), "\n")
+
+# Map hub LR pairs to ILD communication
+hub_comm <- comm_ild %>%
+  filter(interaction_name %in% hub_lr_db$interaction_name) %>%
+  arrange(desc(prob))
+
+cat("Top hub-mediated interactions in ILD:\n")
+print(head(hub_comm, 20))
+
+cat("Pathways involved:\n")
+print(table(hub_comm$pathway_name))
+
+cat("Cell-cell pairs involved:\n")
+print(table(hub_comm$source, hub_comm$target))
+
+# --------------------- Section 10: Hub Gene Bubble & Dot Plots ---------------
+# EGF signaling (AREG-EGFR axis)
+pdf("Figure_HubGenes_EGF_Bubble.pdf", width = 16, height = 8)
+lr_egf <- hub_comm %>% filter(pathway_name == "EGF")
+netVisual_bubble(
+  cellchat_list[["ILD"]],
+  pairLR.use   = data.frame(interaction_name = unique(lr_egf$interaction_name)),
+  remove.isolate = TRUE,
+  font.size    = 12,
+  title.name   = "EGF signaling (AREG-EGFR) in ILD"
+)
+dev.off()
+
+# VEGF signaling (VEGFA-FLT1/KDR axis)
+pdf("Figure_HubGenes_VEGF_Bubble.pdf", width = 10, height = 5)
+lr_vegf <- hub_comm %>% filter(pathway_name == "VEGF")
+netVisual_bubble(
+  cellchat_list[["ILD"]],
+  pairLR.use   = data.frame(interaction_name = unique(lr_vegf$interaction_name)),
+  remove.isolate = TRUE,
+  font.size    = 12,
+  title.name   = "VEGF signaling (VEGFA-FLT1/KDR) in ILD"
+)
+dev.off()
+
+# ADGRG signaling (COL3A1-ADGRG1 axis)
+pdf("Figure_HubGenes_ADGRG_Bubble.pdf", width = 8, height = 4)
+lr_adgrg <- hub_comm %>% filter(pathway_name == "ADGRG")
+netVisual_bubble(
+  cellchat_list[["ILD"]],
+  pairLR.use   = data.frame(interaction_name = unique(lr_adgrg$interaction_name)),
+  remove.isolate = TRUE,
+  font.size    = 12,
+  title.name   = "ADGRG signaling (COL3A1-ADGRG1) in ILD"
+)
+dev.off()
+
+# Top 10 hub-mediated interactions (panoramic view)
+pdf("Figure_HubGenes_Top10_Bubble.pdf", width = 16, height = 10)
+hub_comm_top10 <- hub_comm %>%
+  group_by(interaction_name) %>%
+  summarise(max_prob = max(prob)) %>%
+  arrange(desc(max_prob)) %>%
+  head(10)
+
+netVisual_bubble(
+  cellchat_list[["ILD"]],
+  pairLR.use   = data.frame(interaction_name = hub_comm_top10$interaction_name),
+  remove.isolate = TRUE,
+  font.size    = 12,
+  title.name   = "Top 10 Hub gene-mediated communications in ILD"
+)
+dev.off()
+
+# Dot plot of top 20 hub-mediated interactions
+hub_comm_plot <- hub_comm %>%
+  group_by(interaction_name) %>%
+  summarise(total_prob = sum(prob)) %>%
+  arrange(desc(total_prob)) %>%
+  head(20) %>%
+  left_join(hub_comm, by = "interaction_name")
+
+pdf("Figure_HubGenes_Heatmap.pdf", width = 18, height = 12)
+ggplot(hub_comm_plot, aes(x = source, y = interaction_name, size = prob, color = prob)) +
+  geom_point() +
+  scale_color_gradient(low = "lightblue", high = "red") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 11)
+  ) +
+  labs(
+    title = "Communications mediated by Quercetin-predicted hub genes in ILD",
+    x     = "Sender -> Receiver",
+    y     = "Ligand-Receptor pair",
+    size  = "Prob",
+    color = "Prob"
+  )
+dev.off()
+
+# Export hub communication table
+write.csv(hub_comm, "hub_comm_ILD.csv", row.names = FALSE)
+
+# --------------------- Section 11: Key LR Chord Diagrams ---------------------
+# COL3A1-ADGRG1 (highest prob hub LR)
+pdf("Figure_COL3A1_ADGRG1_Chord.pdf", width = 10, height = 10)
+netVisual_individual(
+  cellchat_list[["ILD"]],
+  signaling    = lr_adgrg$pathway_name,
+  pairLR.use   = lr_adgrg$interaction_name,
+  layout       = "circle"
+)
+dev.off()
+
+# EGFR axis
+lr_egfr <- hub_comm %>% filter(grepl("EGFR", interaction_name))
+pdf("Figure_EGFR_Communication_Chord.pdf", width = 11, height = 11)
+netVisual_aggregate(
+  cellchat_list[["ILD"]],
+  signaling     = unique(lr_egfr$pathway_name),
+  layout        = "chord",
+  label.size    = 3.2,
+  edge.width.max = 8,
+  title.name    = "EGFR-mediated communications in ILD"
+)
+dev.off()
+
+# --------------------- Section 12: Target Cell Communication -----------------
+# Target cells with prominent hub gene UCell differences
+target_cells <- c("AT1", "AM", "LAMac")
+
+# Incoming signals to target cells (all-cell communication)
+incoming_to_target <- comm_ild %>%
+  filter(target %in% target_cells) %>%
+  arrange(target, desc(prob)) %>%
+  dplyr::select(
+    Receiver              = target,
+    Sender                = source,
+    Ligand                = ligand,
+    Receptor              = receptor,
+    Pathway               = pathway_name,
+    `Communication prob`  = prob,
+    `Interaction name`    = interaction_name
+  )
+
+write.csv(
+  incoming_to_target,
+  "Table_Incoming_Communications_to_AT1_AM_LAMac.csv",
+  row.names = FALSE
+)
+
+cat("Incoming pathways to target cells:\n")
+print(table(incoming_to_target$Pathway))
+
+# Outgoing signals from target cells
+outgoing_from_target <- comm_ild %>%
+  filter(source %in% target_cells) %>%
+  arrange(source, desc(prob)) %>%
+  dplyr::select(
+    Sender                = source,
+    Receiver              = target,
+    Ligand                = ligand,
+    Receptor              = receptor,
+    Pathway               = pathway_name,
+    `Communication prob`  = prob,
+    `Interaction name`    = interaction_name
+  )
+
+write.csv(
+  outgoing_from_target,
+  "Table_Outgoing_Communications_from_AT1_AM_LAMac.csv",
+  row.names = FALSE
+)
+
+cat("Outgoing pathways from target cells:\n")
+print(table(outgoing_from_target$Pathway))
+
+# ==============================================================================
+cat("CellChat analysis complete. All figures and tables saved.\n")
+# ==============================================================================
