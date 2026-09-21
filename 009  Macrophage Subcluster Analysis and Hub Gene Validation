@@ -1,0 +1,310 @@
+# ==============================================================================
+# Macrophage Subcluster Analysis and Hub Gene Validation
+# ==============================================================================
+# Title: Subpopulation Profiling of Macrophages and Hub Gene Expression
+#        in ILD vs. Donor scRNA-seq Data
+#
+# Description:
+#   This script extracts macrophage cells from the annotated Seurat object,
+#   performs unsupervised subclustering, assigns subtype labels (SPP1+Mac,
+#   AM, MDM, IM, InfMac, MetMac, MtMac, FibMac, LAMac, IFNMac, CTLMac),
+#   removes contaminating clusters, evaluates subcluster composition between
+#   ILD and Donor conditions, and visualizes hub gene expression across
+#   macrophage subtypes.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# Create output directories
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+# --------------------- Section 2: Load Annotated Seurat Object --------------
+scRNA <- readRDS("05_Lung_Donor_vs_ILD.rds")
+
+# Define hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Inspect available cell type labels
+unique(scRNA$celltype_abbr)
+
+# --------------------- Section 3: Extract Macrophage Cells -------------------
+# Subset macrophages based on predefined cell type abbreviations
+mac <- subset(scRNA, celltype_abbr %in% c(
+  "SPP1+Mac", "LAMac", "MDM", "InfMac"
+))
+
+cat("Number of macrophage cells:", ncol(mac), "\n")
+table(mac$celltype_abbr)
+
+# --------------------- Section 4: Subclustering of Macrophages --------------
+mac <- FindVariableFeatures(mac, nfeatures = 2000)
+mac <- ScaleData(mac)
+mac <- RunPCA(mac, npcs = 30)
+mac <- FindNeighbors(mac, dims = 1:20)
+mac <- FindClusters(mac, resolution = 0.3)
+mac <- RunUMAP(mac, dims = 1:20)
+
+# Visualize raw subclusters
+DimPlot(mac, reduction = "umap", label = TRUE) +
+  ggtitle("Macrophage Re-clustering")
+
+ggsave("figures/mac_Reclustering_RawUMAP.pdf", width = 7, height = 6)
+
+# Feature plots for hub genes
+p_feature_all <- FeaturePlot(mac, features = hub_genes, reduction = "umap", ncol = 2)
+ggsave(
+  "figures/mac_FeaturePlot_Markers.pdf",
+  plot   = p_feature_all,
+  width  = 10,
+  height = 8
+)
+
+# --------------------- Section 5: Marker Gene Identification ----------------
+mac_markers <- FindAllMarkers(
+  mac,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+# Export top 10 markers per subcluster
+mac_top10 <- mac_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10)
+
+write.csv(
+  mac_top10,
+  "Mac_cluster_top10_markers_raw.csv",
+  row.names = FALSE
+)
+
+# --------------------- Section 6: Manual Subcluster Annotation ---------------
+# Map Seurat cluster IDs to biologically meaningful macrophage subtypes
+mac$subcluster <- factor(
+  case_when(
+    mac$seurat_clusters == "0"  ~ "SPP1+Mac",
+    mac$seurat_clusters == "1"  ~ "AM",
+    mac$seurat_clusters == "2"  ~ "MDM",
+    mac$seurat_clusters == "3"  ~ "IM",
+    mac$seurat_clusters == "5"  ~ "InfMac",
+    mac$seurat_clusters == "6"  ~ "MetMac",
+    mac$seurat_clusters == "7"  ~ "MtMac",
+    mac$seurat_clusters == "8"  ~ "FibMac",
+    mac$seurat_clusters == "9"  ~ "LAMac",
+    mac$seurat_clusters == "10" ~ "IFNMac",
+    mac$seurat_clusters == "11" ~ "CTLMac",
+    TRUE                         ~ NA_character_   # Cluster 4 and others = contaminants
+  ),
+  levels = c(
+    "SPP1+Mac", "AM", "MDM", "IM", "InfMac",
+    "MetMac", "MtMac", "FibMac", "LAMac",
+    "IFNMac", "CTLMac"
+  )
+)
+
+cat("Number of unannotated (NA) cells:", sum(is.na(mac$subcluster)), "\n")
+table(mac$subcluster, useNA = "ifany")
+
+# --------------------- Section 7: Remove Contaminating Clusters --------------
+mac_clean <- subset(mac, subset = !is.na(subcluster))
+mac_clean$subcluster <- droplevels(mac_clean$subcluster)
+
+# Re-run dimensionality reduction on cleaned object
+mac_clean <- RunPCA(mac_clean, npcs = 30)
+mac_clean <- RunUMAP(mac_clean, dims = 1:20)
+
+# Save clean UMAP plot
+DimPlot(
+  mac_clean,
+  reduction = "umap",
+  group.by  = "subcluster",
+  label     = TRUE,
+  repel     = TRUE
+) + ggtitle("Clean Macrophage Subclusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave("figures/Mac_Clean_UMAP.pdf", width = 7, height = 6)
+
+# --------------------- Section 8: Inherit Clinical Group Labels --------------
+mac_clean$condition <- scRNA$Group[Cells(mac_clean)]
+
+table(mac_clean$subcluster, mac_clean$condition)
+
+# --------------------- Section 9: Proportion Plot (ILD vs. Donor) ------------
+df_mac <- as.data.frame(table(
+  Condition  = mac_clean$condition,
+  Subcluster = mac_clean$subcluster
+))
+
+p_prop <- ggplot(df_mac, aes(x = Condition, y = Freq, fill = Subcluster)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  labs(
+    title = "Macrophage Subcluster Composition in ILD vs. Donor",
+    x     = "Condition",
+    y     = "Fraction of Macrophage Cells"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+ggsave(
+  "figures/Mac_Subcluster_Proportion_ILD_vs_Donor.pdf",
+  plot   = p_prop,
+  width  = 7,
+  height = 5
+)
+
+# --------------------- Section 10: Faceted UMAP by Condition -----------------
+umap_coords <- Embeddings(mac_clean, reduction = "umap")
+plot_df <- data.frame(
+  UMAP_1     = umap_coords[, 1],
+  UMAP_2     = umap_coords[, 2],
+  subcluster = mac_clean$subcluster,
+  condition  = mac_clean$condition
+)
+
+p_umap_facet <- ggplot(
+  plot_df,
+  aes(x = UMAP_1, y = UMAP_2, color = subcluster)
+) +
+  geom_point(size = 0.3, alpha = 0.85) +
+  facet_wrap(~ condition, nrow = 1) +
+  ggtitle("Macrophage Subclusters in ILD vs. Donor") +
+  theme_classic() +
+  theme(
+    legend.title  = element_blank(),
+    axis.text     = element_blank(),
+    axis.ticks    = element_blank(),
+    panel.border  = element_rect(color = "black", fill = NA)
+  )
+
+ggsave(
+  "figures/Mac_UMAP_Faceted_Condition.pdf",
+  plot   = p_umap_facet,
+  width  = 10,
+  height = 4
+)
+
+# --------------------- Section 11: Hub Gene Visualization --------------------
+Idents(mac_clean) <- "subcluster"
+
+# Downsample cells per subcluster for heatmap (max 1000 per cluster)
+set.seed(123)
+cells_sampled <- lapply(levels(mac_clean$subcluster), function(cl) {
+  cells <- WhichCells(mac_clean, expression = subcluster == cl)
+  n_sample <- min(length(cells), 1000)
+  sample(cells, n_sample)
+})
+cells_use <- unlist(cells_sampled)
+
+# Heatmap of hub gene expression
+p_heatmap <- DoHeatmap(
+  mac_clean,
+  cells    = cells_use,
+  features = hub_genes,
+  group.by = "subcluster",
+  slot     = "data",
+  size     = 4,
+  raster   = FALSE
+) +
+  scale_fill_gradient2(
+    low      = "blue",
+    mid      = "white",
+    high     = "red",
+    midpoint = 2.5
+  ) +
+  ggtitle("Hub Gene Expression in Macrophage Subclusters")
+
+print(p_heatmap)
+
+# Violin plots for selected hub genes
+p_violin <- VlnPlot(
+  mac_clean,
+  features = c("MME", "SERPINE1", "VEGFA"),
+  group.by = "subcluster",
+  pt.size  = 0,
+  ncol     = 2
+) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_violin)
+
+# Feature plots on UMAP
+p_feature_hub <- FeaturePlot(
+  mac_clean,
+  features = c("MME", "SERPINE1", "VEGFA"),
+  reduction = "umap",
+  pt.size   = 0.5,
+  order     = TRUE
+) +
+  theme(legend.position = "right")
+
+print(p_feature_hub)
+
+# Dot plot for all hub genes
+valid_hub_genes <- intersect(hub_genes, rownames(mac_clean))
+if (length(valid_hub_genes) < length(hub_genes)) {
+  cat("Warning: genes not found in mac_clean:",
+      setdiff(hub_genes, valid_hub_genes), "\n")
+}
+
+p_dot <- DotPlot(
+  object   = mac_clean,
+  features = valid_hub_genes,
+  cols     = c("lightgrey", "red"),
+  dot.scale = 6
+) +
+  scale_color_gradient2(
+    low       = "lightgrey",
+    mid       = "white",
+    high      = "red",
+    midpoint  = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y  = element_text(size = 10),
+    plot.title   = element_text(hjust = 0.5)
+  ) +
+  ggtitle("Hub Gene Expression in Macrophage Subclusters")
+
+ggsave("Mac_HubGenes_DotPlot.pdf", p_dot, width = 10, height = 6)
+
+# --------------------- Section 12: Save Results -----------------------------
+mac_final <- mac_clean
+saveRDS(mac_final, file = "05_Mac_Cells_Final.rds")
+
+# Write subcluster annotations back to the main Seurat object
+scRNA$mac_subcluster <- NA
+scRNA$mac_subcluster[Cells(mac_final)] <- mac_final$subcluster
+scRNA$mac_condition <- NA
+scRNA$mac_condition[Cells(mac_final)] <- mac_final$condition
+
+saveRDS(scRNA, file = "05_Lung_Donor_vs_ILD.rds")
+
+# Export annotation mapping and marker table
+write.csv(
+  data.frame(
+    seurat_cluster = 0:10,
+    subcluster     = levels(mac_clean$subcluster)
+  ),
+  "Mac_Cluster_Annotation.csv",
+  row.names = FALSE
+)
+
+write.csv(mac_markers, "Mac_Subcluster_Markers.csv", row.names = FALSE)
+
+cat("Macrophage subcluster analysis complete. All outputs saved.\n")
