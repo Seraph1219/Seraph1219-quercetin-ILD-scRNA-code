@@ -1,0 +1,316 @@
+# ==============================================================================
+# Fibroblast Pseudotime Trajectory Inference and Gene Dynamics Analysis
+# ==============================================================================
+# Title: Pseudotime Trajectory Analysis of Fibroblast Subpopulations in ILD
+#
+# Description:
+#   This script performs trajectory inference on fibroblast subclusters using
+#   Slingshot, validates the trajectory with known marker genes, visualizes
+#   gene expression dynamics along pseudotime, and conducts functional
+#   enrichment analysis of trajectory-associated genes.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 0: Load Required Libraries ---------------------
+library(Seurat)
+library(slingshot)
+library(tradeSeq)
+library(SingleCellExperiment)
+library(patchwork)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+
+# --------------------- Section 1: Load Data & Preprocessing -------------------
+# Load fibroblast Seurat object
+seu_clean <- readRDS("06_Fibroblast_COL3A1_Stratified.rds")
+
+cat("Cells:", ncol(seu_clean), "\n")
+cat("Genes:", nrow(seu_clean), "\n")
+
+# Remove contaminating clusters
+seu_clean <- subset(
+  seu_clean,
+  subcluster != "Subcluster_3" & subcluster != "Subcluster_7"
+)
+
+# --------------------- Section 2: Slingshot Trajectory Inference -------------
+# Extract UMAP coordinates and cluster labels
+umap_coords <- Embeddings(seu_clean, reduction = "umap")
+cluster_labels <- seu_clean$subcluster
+
+# Run Slingshot (explicitly define quiescent fibroblasts as start cluster)
+sds <- slingshot(
+  data          = umap_coords,
+  clusterLabels = cluster_labels,
+  start.clus    = "Quies-Fib"
+)
+sds <- getCurves(sds)
+
+# --------------------- Section 3: Extract Pseudotime & Cell Weights -----------
+# Extract pseudotime (use first lineage)
+pt_all <- slingPseudotime(sds)
+if (is.matrix(pt_all)) {
+  pt_all <- pt_all[, 1]
+}
+
+# Remove cells with NA pseudotime
+keep <- !is.na(pt_all)
+pt <- pt_all[keep]
+
+# Extract cell weights (required for tradeSeq)
+w_all <- slingCurveWeights(sds)
+w <- w_all[keep, , drop = FALSE]
+
+stopifnot(length(pt) == nrow(w))
+
+# Add pseudotime back to Seurat object
+seu_clean$Pseudotime <- NA
+seu_clean$Pseudotime[keep] <- pt
+
+# --------------------- Section 4: Visualize Trajectory on UMAP ----------------
+# Basic pseudotime coloring
+p_pt <- FeaturePlot(seu_clean, features = "Pseudotime", reduction = "umap") +
+  ggtitle("Pseudotime Trajectory")
+
+# Overlay Slingshot curves
+curves_df <- as.data.frame(slingCurves(sds, as.df = TRUE))
+colnames(curves_df)[1:2] <- c("x", "y")
+
+p_curve <- FeaturePlot(seu_clean, features = "Pseudotime", reduction = "umap") +
+  geom_path(
+    data  = curves_df,
+    aes(x = x, y = y, group = Lineage),
+    color = "red",
+    linewidth = 1
+  ) +
+  ggtitle("Pseudotime with Slingshot Curves")
+
+print(p_pt | p_curve)
+
+# --------------------- Section 5: Validate Trajectory with Marker Genes -------
+# Define marker genes for each fibroblast state
+quies_markers  <- c("PDGFRA", "CAV1")
+homeo_markers  <- c("COL1A1", "COL3A1", "DCN")
+inflam_markers <- c("CCL2", "CXCL12", "IL6", "PTGS2", "SERPINE1")
+sen_markers    <- c("CDKN2A", "CDKN1A")
+myo_markers    <- c("ACTA2", "TAGLN")
+ecm_markers    <- c("MMP1", "MMP3")
+wnt_markers    <- c("WNT5A", "AXIN2")
+
+all_markers <- c(
+  quies_markers, homeo_markers, sen_markers,
+  inflam_markers, myo_markers, ecm_markers, wnt_markers
+)
+
+# UMAP visualization of all markers
+FeaturePlot(seu_clean, features = all_markers, reduction = "umap", ncol = 3)
+
+# Grouped scatter plots: marker expression vs. pseudotime
+marker_groups <- list(
+  "Quiescent"      = quies_markers,
+  "Homeostatic"    = homeo_markers,
+  "Senescent"      = sen_markers,
+  "Inflammatory"   = inflam_markers,
+  "Myofibroblast"  = myo_markers,
+  "ECM_Remodeling" = ecm_markers,
+  "Wnt_Signaling"  = wnt_markers
+)
+
+group_plots <- lapply(names(marker_groups), function(group_name) {
+  genes <- marker_groups[[group_name]]
+
+  sub_plots <- lapply(genes, function(g) {
+    if (g %in% rownames(seu_clean)) {
+      exp_data <- GetAssayData(seu_clean, layer = "data")[g, ]
+      df <- data.frame(
+        PT  = seu_clean$Pseudotime,
+        EXP = as.numeric(exp_data)
+      )
+      ggplot(df, aes(x = PT, y = EXP)) +
+        geom_point(size = 0.5, alpha = 0.3, color = "grey40") +
+        geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 0.8) +
+        labs(title = g, x = NULL, y = NULL) +
+        theme_minimal(base_size = 10) +
+        theme(plot.title = element_text(hjust = 0.5, size = 9))
+    } else {
+      plot_annotation(title = paste(g, "(Not Found)")) & theme_void()
+    }
+  })
+
+  wrap_plots(sub_plots, ncol = 1) +
+    plot_annotation(
+      title = group_name,
+      theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+    )
+})
+
+final_marker_plot <- wrap_plots(group_plots, nrow = 1) +
+  plot_layout(guides = "collect")
+
+print(final_marker_plot)
+
+# Violin plot by pseudotime bins
+seu_clean$Pseudotime_Bin <- cut(
+  seu_clean$Pseudotime,
+  breaks = c(0, 5, 10, 15, 20),
+  labels = c("Quies (0-5)", "Early (5-10)", "Late (10-15)", "End (15-20)")
+)
+
+VlnPlot(
+  seu_clean,
+  features  = c("IL6", "SERPINE1", "COL3A1", "CAV1"),
+  pt.size   = 0,
+  group.by  = "Pseudotime_Bin",
+  ncol      = 2
+)
+
+# --------------------- Section 6: Gene Expression Heatmap ---------------------
+# Binned heatmap of all marker genes
+features <- c(
+  quies_markers, homeo_markers, sen_markers,
+  inflam_markers, myo_markers, ecm_markers, wnt_markers
+)
+key_genes <- c("CAV1", "COL3A1", "IL6", "SERPINE1", "MMP1")
+
+mat <- FetchData(seu_clean, vars = features)
+pseu_clean <- seu_clean$Pseudotime
+
+df_clean <- data.frame(Pseudotime = pseu_clean, mat)
+df_clean <- df_clean[!is.na(df_clean$Pseudotime), ]
+df_sorted <- df_clean[order(df_clean$Pseudotime), ]
+mat_sorted <- as.matrix(df_sorted[, -1])
+
+# Bin into 20 pseudotime windows
+n_bins <- 20
+breaks <- quantile(
+  df_sorted$Pseudotime,
+  probs = seq(0, 1, length.out = n_bins + 1)
+)
+bin_idx <- cut(
+  df_sorted$Pseudotime,
+  breaks        = breaks,
+  include.lowest = TRUE,
+  labels        = FALSE
+)
+
+mat_binned <- sapply(1:n_bins, function(i) {
+  colMeans(mat_sorted[bin_idx == i, , drop = FALSE])
+})
+rownames(mat_binned) <- features
+
+# Highlight key genes in row names
+rownames(mat_binned) <- ifelse(
+  rownames(mat_binned) %in% key_genes,
+  paste0(rownames(mat_binned), " *"),
+  rownames(mat_binned)
+)
+
+pheatmap(
+  mat_binned,
+  scale         = "row",
+  cluster_rows  = FALSE,
+  cluster_cols  = FALSE,
+  color         = colorRampPalette(c("blue", "white", "red"))(100),
+  main          = "Gene Expression Dynamics along Pseudotime"
+)
+
+# --------------------- Section 7: Top 50 Pseudotime-Correlated Genes ----------
+# Calculate Spearman correlation for all genes
+mat_all <- GetAssayData(seu_clean, layer = "data")
+pseudo <- seu_clean$Pseudotime
+
+keep2 <- !is.na(pseudo)
+mat_all <- mat_all[, keep2]
+pseudo <- pseudo[keep2]
+
+cat("Calculating correlations...\n")
+cor_res <- t(sapply(rownames(mat_all), function(g) {
+  test <- cor.test(mat_all[g, ], pseudo, method = "spearman", exact = FALSE)
+  c(rho = test$estimate, pvalue = test$p.value)
+}))
+
+cor_df <- as.data.frame(cor_res)
+cor_df$pvalue_adj <- p.adjust(cor_df$pvalue, method = "BH")
+
+# Top 25 positively and 25 negatively correlated genes (FDR < 0.05)
+top_pos <- rownames(cor_df)[order(cor_df$rho, decreasing = TRUE)]
+top_pos <- top_pos[cor_df[top_pos, "pvalue_adj"] < 0.05][1:25]
+
+top_neg <- rownames(cor_df)[order(cor_df$rho, decreasing = FALSE)]
+top_neg <- top_neg[cor_df[top_neg, "pvalue_adj"] < 0.05][1:25]
+
+top50_genes <- c(top_pos, top_neg)
+cat("Number of genes for heatmap:", length(top50_genes), "\n")
+
+# Sort cells by pseudotime and z-score normalize
+cell_order <- order(pseudo)
+mat_top50 <- mat_all[top50_genes, cell_order]
+mat_zscore <- t(scale(t(mat_top50)))
+
+pheatmap(
+  mat_zscore,
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  color         = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  main          = "Top 50 Pseudotime-Correlated Genes (Z-score)"
+)
+
+# --------------------- Section 8: Prepare for tradeSeq -----------------------
+# Subset Seurat object to cells with pseudotime
+seu_clean_sub <- subset(seu_clean, cells = names(pt))
+sce_sub <- as.SingleCellExperiment(seu_clean_sub)
+
+# Select highly variable genes
+hvgs <- VariableFeatures(seu_clean)
+hvgs <- hvgs[hvgs %in% rownames(sce_sub)]
+
+# Extract expression matrix (dgCMatrix)
+emat <- assay(sce_sub[hvgs, ])
+
+# Fit GAM model for lineage 1
+w_use <- w[, "Lineage1", drop = FALSE]
+
+sce_fit <- fitGAM(
+  counts      = emat,
+  pseudotime  = pt,
+  cellWeights = w_use,
+  nknots      = 6,
+  verbose     = TRUE
+)
+
+# --------------------- Section 9: Functional Enrichment -----------------------
+# Identify trajectory-associated genes
+asso_res <- associationTest(sce_fit)
+sig_genes <- rownames(asso_res)[asso_res$pvalue < 0.05]
+
+cat("Number of significantly associated genes:", length(sig_genes), "\n")
+
+# Convert to Entrez IDs
+gene_ids <- bitr(
+  sig_genes,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+# GO Biological Process enrichment
+go_res <- enrichGO(
+  gene          = gene_ids$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05
+)
+
+dotplot(go_res, showCategory = 10) +
+  ggtitle("GO Enrichment of Fibroblast Trajectory Genes")
+
+# ==============================================================================
+# End of Script
+# ==============================================================================
