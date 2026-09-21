@@ -1,0 +1,78 @@
+# ============================================================
+# Venn Diagram Analysis: Quercetin Targets vs. ILD-Related Genes
+# ============================================================
+
+# Clear workspace
+rm(list = ls())
+
+# Load required libraries
+# Install if not already installed:
+# install.packages(c("ggvenn", "VennDiagram", "venn", "openxlsx", "purrr"))
+library(ggvenn)
+library(VennDiagram)
+library(venn)
+library(openxlsx)
+library(purrr)
+
+# ------------------------------------------------------------
+# 1. Data Import
+# ------------------------------------------------------------
+
+# Read gene lists from the second sheet of the Excel file
+venn_dat <- read.xlsx("quercetin+ILD.xlsx", sheet = 2)
+
+# Convert data frame to a named list (required by ggvenn)
+venn_list <- as.list(venn_dat)
+
+# Remove NA values and empty strings from each vector in the list
+venn_list <- map(venn_list, na.omit)
+venn_list <- map(venn_list, function(x) x[x != ""])
+
+# ------------------------------------------------------------
+# 2. Generate Venn Diagram
+# ------------------------------------------------------------
+
+p <- ggvenn(
+  data            = venn_list,        # List of gene sets
+  show_elements   = FALSE,            # Show gene names (TRUE) or counts (FALSE)
+  label_sep       = "\n",             # Separator for gene names when show_elements = TRUE
+  show_percentage = TRUE,             # Display percentage for each subset
+  digits          = 1,                # Decimal places for percentages
+  fill_color      = c("#E41A1C", "#1E90FF", "#FF8C00", "#80FF00"), # Fill colors
+  fill_alpha      = 0.5,              # Fill transparency
+  stroke_color    = "white",          # Border color
+  stroke_alpha    = 0.5,              # Border transparency
+  stroke_size     = 0.5,              # Border line thickness
+  stroke_linetype = "solid",          # Border line type
+  set_name_color  = "black",          # Set label color
+  set_name_size   = 5,                # Set label font size
+  text_color      = "black",          # Intersection count color
+  text_size       = 4                 # Intersection count font size
+)
+
+# Display plot
+print(p)
+
+# Save plot as PNG
+ggsave("R1_venn.png", plot = p, width = 6, height = 6, dpi = 300)
+
+# ------------------------------------------------------------
+# 3. Extract Intersection Details
+# ------------------------------------------------------------
+
+# Get partition information for all intersections
+R1_inter <- get.venn.partitions(venn_list)
+
+# Collapse gene name vectors into comma-separated strings
+for (i in 1:nrow(R1_inter)) {
+  R1_inter[i, "values"] <- paste(R1_inter[[i, "..values.."]], collapse = ", ")
+}
+
+# Export the first intersection (all-set overlap) to a tab-delimited file
+write.table(
+  R1_inter[1, 6],
+  file      = "R1_Venn.txt",
+  row.names = FALSE,
+  sep       = "\t",
+  quote     = FALSE
+)
