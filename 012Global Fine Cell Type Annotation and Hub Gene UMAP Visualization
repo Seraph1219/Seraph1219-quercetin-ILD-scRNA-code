@@ -1,0 +1,159 @@
+# ==============================================================================
+# Global Fine Cell Type Annotation and Hub Gene UMAP Visualization
+# ==============================================================================
+# Title: Construction of a Unified Fine-Resolution Cell Atlas and
+#        Pan-Cell-Type Hub Gene Expression Landscape
+#
+# Description:
+#   This script integrates subcluster annotations from fibroblasts, macrophages,
+#   epithelial cells, and endothelial cells into a single unified fine-resolution
+#   cell type label (celltype_fine_corrected). Contaminating clusters are
+#   relabeled as "Unknown". The script then visualizes the expression of
+#   nine hub genes across all cells using UMAP FeaturePlots.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --------------------- Section 2: Load Annotated Seurat Object ----------------
+# Set working directory (update path as needed)
+setwd("E:/VM_share/8.单细胞分析/单细胞数据集/肺组织/acceptableset")
+
+scRNA <- readRDS("05_Lung_Donor_vs_ILD.rds")
+
+# Define hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Verify hub genes are present in the expression matrix
+cat("Hub genes found in dataset:", intersect(hub_genes, rownames(scRNA)), "\n")
+
+# --------------------- Section 3: Construct Fine-Resolution Annotation --------
+# Extract metadata for efficient vectorized operations
+meta_data <- scRNA@meta.data
+
+# Map subcluster IDs to biologically meaningful fine cell type labels
+meta_data <- meta_data %>%
+  dplyr::mutate(
+    celltype_fine_corrected = dplyr::case_when(
+      # Fibroblast subclusters
+      fibro_subcluster == "0" ~ "LipFib",
+      fibro_subcluster == "1" ~ "ImmFib",
+      fibro_subcluster == "2" ~ "iFib",
+      fibro_subcluster %in% c("3", "4", "5") ~ "Unknown",
+
+      # Macrophage subclusters
+      mac_subcluster == "0"  ~ "SPP1+Mac",
+      mac_subcluster == "1"  ~ "AM",
+      mac_subcluster == "2"  ~ "MDM",
+      mac_subcluster == "3"  ~ "IM",
+      mac_subcluster == "5"  ~ "InfMac",
+      mac_subcluster == "6"  ~ "MetMac",
+      mac_subcluster == "7"  ~ "MtMac",
+      mac_subcluster == "8"  ~ "FibMac",
+      mac_subcluster == "9"  ~ "LAMac",
+      mac_subcluster == "10" ~ "IFNMac",
+      mac_subcluster == "11" ~ "CTLMac",
+      mac_subcluster == "4"  ~ "Unknown",
+
+      # Epithelial subclusters
+      epi_subcluster == "0"  ~ "SAEC",
+      epi_subcluster == "1"  ~ "AT1",
+      epi_subcluster == "2"  ~ "AT2",
+      epi_subcluster == "3"  ~ "BATEC",
+      epi_subcluster == "4"  ~ "IREC",
+      epi_subcluster == "5"  ~ "MSEC",
+      epi_subcluster == "6"  ~ "CC",
+      epi_subcluster == "8"  ~ "CEC",
+      epi_subcluster == "9"  ~ "SEC",
+      epi_subcluster == "12" ~ "MLEC",
+      epi_subcluster %in% c("7", "10", "11", "13") ~ "Unknown",
+
+      # Endothelial subclusters
+      Endo_subcluster == "0" ~ "CapEC",
+      Endo_subcluster == "1" ~ "VenEC",
+      Endo_subcluster == "2" ~ "CapEC-II",
+      Endo_subcluster == "3" ~ "ArtEC",
+      Endo_subcluster == "4" ~ "laEC",
+      Endo_subcluster == "5" ~ "SaEC",
+      Endo_subcluster == "7" ~ "MLEC",
+      Endo_subcluster == "9" ~ "LEC",
+      Endo_subcluster %in% c("6", "8", "10") ~ "Unknown",
+
+      # Default: retain original broad annotation for other cells (e.g., T/B/NK)
+      TRUE ~ as.character(celltype_abbr)
+    )
+  )
+
+# Write modified metadata back to Seurat object
+scRNA@meta.data <- meta_data
+
+# Set Idents for downstream analysis
+Idents(scRNA) <- scRNA$celltype_fine_corrected
+
+# Summarize fine cell type distribution
+cat("\nFinal fine-resolution cell type annotation:\n")
+print(sort(table(scRNA$celltype_fine_corrected), decreasing = TRUE))
+
+# --------------------- Section 4: Save Integrated Object ----------------------
+# Save the Seurat object with unified fine annotation
+saveRDS(
+  scRNA,
+  file = "07_Lung_Donor_vs_ILD_celltype_fine_cleaned.rds"
+)
+
+# Verification
+table(scRNA@meta.data$celltype_fine_corrected)
+table(scRNA@meta.data$mac_subcluster)
+table(scRNA@meta.data$fibro_subcluster)
+
+# --------------------- Section 5: Pan-Cell-Type Hub Gene UMAP Visualization --
+# Generate individual FeaturePlots for each hub gene
+plots <- lapply(hub_genes, function(g) {
+  FeaturePlot(
+    scRNA,
+    features  = g,
+    reduction = "umap",
+    pt.size   = 0.4,
+    order     = TRUE,
+    cols      = c("grey90", "red")
+  ) +
+    scale_color_gradient(
+      low    = "grey90",
+      high   = "red",
+      guide = "none"
+    ) +
+    theme(
+      plot.title      = element_text(hjust = 0.5, size = 14, face = "bold"),
+      legend.position = "none",
+      axis.text       = element_blank(),
+      axis.title      = element_blank(),
+      axis.ticks      = element_blank(),
+      panel.grid      = element_blank(),
+      plot.margin     = margin(2, 2, 2, 2)
+    ) +
+    ggtitle(g)
+})
+
+# Combine all FeaturePlots into a single composite figure (5 columns)
+combined_plot <- wrap_plots(plots, ncol = 5)
+
+# Display and save
+print(combined_plot)
+
+dir.create("figures", showWarnings = FALSE)
+ggsave(
+  "figures/HubGenes_PanCellType_UMAP.pdf",
+  plot   = combined_plot,
+  width  = 20,
+  height = 4
+)
+
+cat("Global fine annotation and hub gene visualization complete.\n")
