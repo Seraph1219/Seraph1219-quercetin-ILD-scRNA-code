@@ -1,0 +1,264 @@
+
+Post-Analysis Protocol for Molecular Dynamics Simulations
+
+Environment
+
+• GROMACS 2023.x
+
+• VMD 1.9.x (for hydrogen bond analysis)
+
+• Python 3.10.x with matplotlib, numpy, seaborn
+
+• Conda environment: gmxMMPBSA_new (for binding free energy calculation)
+
+1. Preprocessing: Fix Ligand Naming and Topology
+
+1.1 Rename ligand residue from *** to LIG in .gro file
+
+# Open md.gro and replace all occurrences of *** with LIG
+# Save as conf_lig.gro
+sed 's/\*\*\*/LIG/g' md.gro > conf_lig.gro
+
+
+1.2 Update topol.top
+
+; In [ moleculetype ] section, change [ *** ] to [ LIG ]
+; Ensure atom types for O and N atoms are standard (e.g., O, OH, N, NT)
+; If atom types are non-standard (c1, c2, o1), refer to the force field
+; (Amber/CHARMM) and replace with standard types (e.g., CT for sp3 carbon,
+; O for carbonyl oxygen, OH for hydroxyl oxygen)
+
+
+1.3 Regenerate .tpr file
+
+gmx grompp -f md.mdp -c md.gro -p topol.top -o md.tpr
+
+
+2. Create Index Groups
+
+2.1 Generate index file with ligand included
+
+gmx make_ndx -f md.tpr -o index.ndx
+# At prompt:
+#   > 1 | 13          # Merge Protein (1) and Ligand (13)
+#   > name 20 Protein_LIG
+#   > q
+
+
+3. Trajectory Processing (PBC and Centering)
+
+3.1 Remove periodic boundary conditions (PBC)
+
+# Method 1: cluster (recommended for protein-ligand systems)
+gmx trjconv -s md.tpr -f md.xtc -o md_noPBC.xtc -pbc cluster -ur compact -n index.ndx
+# Select group 20 (Protein_LIG) for output
+
+# Method 2: nojump (alternative)
+gmx trjconv -s md.tpr -f md.xtc -o md_noPBC.xtc -pbc nojump -ur compact -n index.ndx
+
+
+3.2 Center the complex
+
+# Center the complex in the simulation box
+gmx trjconv -s md.tpr -f md_noPBC.xtc -o md_center.xtc -center -n index.ndx
+# Select group 20 (Protein_LIG) for centering
+# Select group 0 (System) for output
+
+# Fit trajectory to remove rotation and translation
+gmx trjconv -s md.tpr -f md_center.xtc -o md_final_centered.xtc -fit rot+trans -n index.ndx
+# Select group 20 (Protein_LIG) for fitting
+
+
+4. RMSD Analysis (Stability Assessment)
+
+4.1 Protein backbone RMSD
+
+gmx rms -s md.tpr -f md_final_centered.xtc -o rmsd_backbone.xvg -tu ns -n index.ndx
+# Select group 4 (Backbone) for least squares fit
+# Select group 4 (Backbone) for RMSD calculation
+
+
+4.2 Complex (Protein + Ligand) RMSD
+
+gmx rms -s md.tpr -f md_final_centered.xtc -o rmsd_complex.xvg -tu ns -n index.ndx
+# Select group 4 (Backbone) for least squares fit
+# Select group 20 (Protein_LIG) for RMSD calculation
+
+
+5. RMSF Analysis (Residue Fluctuation)
+
+5.1 Overall protein RMSF
+
+gmx rmsf -f md_final_centered.xtc -s md.tpr -o rmsf.xvg -ox average.pdb -n index.ndx
+# Select group 1 (Protein) or 4 (Backbone)
+
+
+5.2 Per-chain RMSF (for multi-chain proteins)
+
+# First, create index groups for each chain by residue index
+gmx make_ndx -f protein_processed.gro -o index.ndx
+# At prompt (example for 6 chains with 4144 atoms each):
+#   > a 1-4144
+#   > name 19 A_chain
+#   > a 4145-8891
+#   > name 20 B_chain
+#   > ... (repeat for all chains)
+#   > q
+
+# Calculate RMSF for each chain
+gmx rmsf -f md_final_centered.xtc -s md.tpr -n index.ndx -o rmsf_chainA.xvg -res
+gmx rmsf -f md_final_centered.xtc -s md.tpr -n index.ndx -o rmsf_chainB.xvg -res
+# ... (repeat for all chains)
+
+
+6. Radius of Gyration (Rg)
+
+6.1 Protein Rg
+
+gmx gyrate -f md_final_centered.xtc -s md.tpr -o rg.xvg -n index.ndx
+# Select group 1 (Protein)
+
+
+6.2 Complex Rg (for FEL analysis)
+
+gmx gyrate -f md_final_centered.xtc -s md.tpr -o rg_complex.xvg -n index.ndx
+# Select group 20 (Protein_LIG)
+
+
+7. Hydrogen Bond Analysis
+
+7.1 GROMACS hbond (if ligand is recognized)
+
+gmx hbond -f md_final_centered.xtc -s md.tpr -n index.ndx -num hbond.xvg -dist hbdist.xvg -ang hbang.xvg
+# Select group 1 (Protein) for donor/acceptor 1
+# Select group 13 (LIG) for donor/acceptor 2
+
+
+7.2 VMD Hydrogen Bonds (recommended for non-standard ligands)
+
+# Open VMD → Extensions → Analysis → Hydrogen Bonds
+# Selection 1: protein
+# Selection 2: resname LIG (or serial/resid of ligand)
+# Distance cutoff: 3.5 Å
+# Angle cutoff: 30°
+# Click "Find Hydrogen Bonds!"
+# Save output as Hbond_data.txt
+
+
+8. Solvent Accessible Surface Area (SASA)
+
+gmx sasa -f md_final_centered.xtc -s md.tpr -o sasa.xvg -surface "Protein" -n index.ndx
+# Select group 1 (Protein)
+
+
+9. Free Energy Landscape (FEL)
+
+9.1 Prepare combined data file
+
+# Combine RMSD and Rg data for complex
+# Ensure both rmsd_complex1.xvg and rg_complex.xvg have the same time frames
+# Use clean.py to remove headers and merge into combined_data.xvg
+python clean.py
+
+
+9.2 Generate FEL
+
+gmx sham -tsham 300 -nlevels 100 -f combined_data.xvg -ls gibbs.xpm -lsh enthalpy.xpm -lss entropy.xpm
+# Convert .xpm to .txt for plotting
+python xpm2txt.py
+python FEL1.py
+
+
+10. Binding Free Energy (gmx_MMPBSA)
+
+10.1 Prepare trajectory (optional: subsample)
+
+conda activate gmxMMPBSA_new
+
+# Extract last 20 ns (50-70 ns example)
+gmx trjconv -f md_final_centered.xtc -o traj.xtc -b 50000 -e 70000
+# Select group 0 (System)
+
+# Or subsample every 10 ns for 100 ns trajectory
+gmx trjconv -f md_final_centered.xtc -s md.tpr -o traj_100ns_10ns.xtc -dt 10000
+
+
+10.2 Run gmx_mmpbsa
+
+chmod +x gmx_mmpbsa.sh
+
+# Run on subsampled trajectory
+./gmx_mmpbsa.sh \
+  -f traj_100ns_10ns.xtc \
+  -s md.tpr \
+  -n index.ndx \
+  -pro Protein \
+  -lig LIG
+
+
+10.3 Plot results
+
+python plot_mmpbsa_dg_vs_time.py
+python plot_energy_decomposition.py
+python plot_residue_contribution_pymol.py
+
+
+11. Plotting Scripts (Python)
+
+All Python scripts for generating publication-quality figures are located in the python/ directory:
+
+Script Output
+
+rmsd_5A.py RMSD plot (single or dual)
+
+rmsf.py RMSF per residue
+
+rmsf_chain.py Per-chain RMSF
+
+rg.py Radius of gyration
+
+H_bond.py Hydrogen bond count
+
+sasa.py SASA over time
+
+FEL1.py Free energy landscape
+
+plot_mmpbsa_dg_vs_time.py MMPBSA binding energy
+
+plot_energy_decomposition.py Per-residue energy decomposition
+
+MDplot_all.py Combined summary figure
+
+12. Required Output Files for Figure Generation
+
+Ensure the following files are present before running plotting scripts:
+
+rmsd_backbone.xvg
+rmsd_complex.xvg
+rmsf.xvg
+rg.xvg
+hbond.xvg (or Hbond_data.txt)
+sasa.xvg
+combined_data.xvg (for FEL)
+FINAL_RESULTS_MMPBSA.dat
+RESIDUE_RESULTS.dat
+
+
+Notes
+
+• All trajectories were processed with -pbc cluster and -center to avoid PBC artifacts.
+
+• Ligand residue name was standardized to LIG in both .gro and .top files.
+
+• For gmx_MMPBSA, the MCSH_HOME environment variable was commented out to avoid APBS path errors in WSL/Linux.
+
+• Hydrogen bond analysis was performed using VMD when GROMACS failed to recognize non-standard ligand residues.
+
+• All Python scripts assume input .xvg files are in the same directory.
+
+如果你愿意，我可以：
+1. 帮你把这份流程压成 1 页 Methods 英文段落，直接贴进论文
+2. 检查你实际目录里的文件，帮你写一份精确的 README.md 放 GitHub
+3. 帮你把 clean.py 和 xpm2txt.py 也写出来，确保能跑通
+
+你先看看这版整理是否和你实际操作一致？
