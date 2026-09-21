@@ -1,0 +1,250 @@
+# ==============================================================================
+# Macrophage-Fibroblast Cell-Cell Communication Analysis via CellChat
+# ==============================================================================
+# Title: Macrophage-Fibroblast Ligand-Receptor Mediated Communication in ILD
+#        and Hub Gene-Driven Signaling Networks
+#
+# Description:
+#   This script performs CellChat-based intercellular communication analysis
+#   focused exclusively on macrophage and fibroblast populations. It:
+#   1. Subsets the integrated Seurat object to Mac and Fibroblast cells
+#   2. Constructs CellChat objects for Donor and ILD conditions
+#   3. Identifies global and cell-type-specific communication patterns
+#   4. Compares ILD vs. Donor to find ILD-enriched communications
+#   5. Filters communications by hub genes from bulk transcriptomics
+# ==============================================================================
+
+rm(list = ls())
+gc()
+
+# --------------------- Section 0: Load Required Libraries ---------------------
+library(Seurat)
+library(CellChat)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+# --------------------- Section 1: Load Integrated Seurat Object --------------
+scRNA <- readRDS("07_Lung_Donor_vs_ILD_celltype_fine_cleaned.rds")
+
+# --------------------- Section 2: Subset Macrophages & Fibroblasts -----------
+# Define fibroblast fine-annotation levels
+fibro_levels <- c(
+  "Adv-Fib", "ECM-Fib", "Myo-Fib", "Inflam-Fib", "Wnt-Fib",
+  "Sen-Fib", "Quies-Fib", "Sec-Fib", "Lip-Fib", "Homeo-Fib"
+)
+
+# Keep cells that are fibroblasts or macrophages (non-NA mac_fine_anno)
+keep <- (
+  scRNA$fibro_fine_anno %in% fibro_levels
+) | (
+  !is.na(scRNA$mac_fine_anno)
+)
+
+scRNA_sub <- subset(scRNA, cells = colnames(scRNA)[keep])
+
+# --------------------- Section 3: Build CellChat Metadata ---------------------
+meta <- data.frame(
+  cell     = colnames(scRNA_sub),
+  celltype = ifelse(
+    scRNA_sub$fibro_fine_anno %in% fibro_levels,
+    "Fibroblast",
+    as.character(scRNA_sub$mac_fine_anno)
+  ),
+  condition = scRNA_sub$Group,
+  stringsAsFactors = FALSE
+)
+
+# Convert to factors
+meta$celltype  <- factor(meta$celltype)
+meta$condition <- factor(meta$condition)
+
+# Set row names to cell barcodes (must be unique)
+rownames(meta) <- meta$cell
+meta$cell <- NULL
+
+# Validate uniqueness and non-missing row names
+stopifnot(
+  !any(duplicated(rownames(meta))),
+  !any(is.na(rownames(meta)))
+)
+
+# --------------------- Section 4: Extract Expression Matrix -------------------
+# Use raw counts for CellChat
+expr <- GetAssayData(scRNA_sub, assay = "RNA", layer = "counts")
+expr <- expr[, rownames(meta), drop = FALSE]
+
+# Validate column-name consistency
+stopifnot(all(colnames(expr) == rownames(meta)))
+
+# --------------------- Section 5: Create CellChat Objects by Condition -------
+conditions <- unique(meta$condition)
+
+cellchat_list <- lapply(conditions, function(cond) {
+
+  idx <- meta$condition == cond
+  meta_sub <- meta[idx, , drop = FALSE]
+  expr_sub <- expr[, idx, drop = FALSE]
+
+  # Drop unused factor levels
+  meta_sub$celltype <- droplevels(meta_sub$celltype)
+
+  cc <- createCellChat(
+    object   = expr_sub,
+    meta     = meta_sub,
+    group.by = "celltype"
+  )
+
+  cc@DB <- CellChatDB.human
+
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc)
+  cc <- filterCommunication(cc, min.cells = 10)
+
+  return(cc)
+})
+
+names(cellchat_list) <- conditions
+
+# Extract Donor and ILD objects
+cellchat_Donor <- cellchat_list[["Donor"]]
+cellchat_ILD  <- cellchat_list[["ILD"]]
+
+# Quick validation
+cat("Donor communication (first rows):\n")
+print(head(subsetCommunication(cellchat_Donor)))
+cat("ILD communication (first rows):\n")
+print(head(subsetCommunication(cellchat_ILD)))
+
+# --------------------- Section 6: Global Communication Overview --------------
+# Extract communication tables
+comm_Donor <- subsetCommunication(cellchat_Donor)
+comm_ILD   <- subsetCommunication(cellchat_ILD)
+
+cat("Columns in ILD communication table:\n")
+print(colnames(comm_ILD))
+
+# Top interactions by communication probability (ILD)
+comm_top <- comm_ILD %>%
+  dplyr::arrange(desc(prob)) %>%
+  dplyr::select(source, target, pathway_name, ligand, receptor, prob, pval)
+
+cat("Top 20 interactions in ILD:\n")
+print(head(comm_top, 20))
+
+# Pathway-level summary (ILD)
+pathway_strength <- comm_ILD %>%
+  dplyr::group_by(pathway_name) %>%
+  dplyr::summarise(
+    total_prob = sum(prob, na.rm = TRUE),
+    n_LR       = dplyr::n()
+  ) %>%
+  dplyr::arrange(desc(total_prob))
+
+cat("Pathway strength ranking in ILD:\n")
+print(pathway_strength)
+
+# --------------------- Section 7: Macrophage -> Fibroblast Focus -------------
+# Identify macrophage and fibroblast cell types
+mac_all <- levels(cellchat_ILD@idents)[
+  grepl("Mac", levels(cellchat_ILD@idents))
+]
+fib_all <- levels(cellchat_ILD@idents)[
+  grepl("Fib", levels(cellchat_ILD@idents))
+]
+
+# Mac -> Fib communication in ILD
+comm_Mac_Fib <- subsetCommunication(
+  cellchat_ILD,
+  sources.use = mac_all,
+  targets.use = fib_all
+) %>%
+  dplyr::arrange(desc(prob))
+
+cat("Top 20 Mac -> Fib interactions in ILD:\n")
+print(head(comm_Mac_Fib, 20))
+
+# --------------------- Section 8: Deep Dive into Key Pathways ----------------
+# Example: FN1 pathway
+cat("FN1 pathway interactions in ILD:\n")
+print(subsetCommunication(cellchat_ILD, signaling = "FN1"))
+
+# Aggregate chord/circle plot for FN1 (all cells)
+netVisual_aggregate(
+  cellchat_ILD,
+  signaling = "FN1",
+  layout    = "circle"
+)
+
+# FN1 restricted to Mac -> Fib
+netVisual_aggregate(
+  cellchat_ILD,
+  signaling    = "FN1",
+  sources.use = mac_all,
+  targets.use = fib_all,
+  layout      = "circle"
+)
+
+# --------------------- Section 9: ILD vs. Donor Comparison -------------------
+# Merge Donor and ILD communications
+diff_comm <- merge(
+  comm_Donor,
+  comm_ILD,
+  by = c("source", "target", "ligand", "receptor", "pathway_name"),
+  suffixes = c(".Donor", ".ILD")
+)
+
+diff_comm$diff <- diff_comm$prob.ILD - diff_comm$prob.Donor
+diff_comm <- diff_comm[order(-diff_comm$diff), ]
+
+cat("ILD-enriched communications (top 20, pval.ILD < 0.05):\n")
+print(
+  head(
+    diff_comm[diff_comm$diff > 0 & diff_comm$pval.ILD < 0.05, ],
+    20
+  )
+)
+
+# --------------------- Section 10: Hub Gene-Filtered Communication -----------
+hub_genes <- c(
+  "CAV1", "CBS", "COL3A1", "EGFR", "IL6",
+  "KDR", "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Hub gene-mediated Mac -> Fib communication in ILD
+comm_Mac_Fib_hub <- comm_Mac_Fib %>%
+  dplyr::filter(
+    ligand %in% hub_genes |
+      receptor %in% hub_genes
+  ) %>%
+  dplyr::arrange(desc(prob))
+
+cat("Hub gene-mediated Mac -> Fib interactions in ILD:\n")
+print(head(comm_Mac_Fib_hub, 20))
+
+# ILD vs. Donor for hub gene-mediated communications
+diff_comm_hub <- merge(
+  comm_Donor %>% dplyr::filter(ligand %in% hub_genes | receptor %in% hub_genes),
+  comm_ILD   %>% dplyr::filter(ligand %in% hub_genes | receptor %in% hub_genes),
+  by = c("source", "target", "ligand", "receptor", "pathway_name"),
+  suffixes = c(".Donor", ".ILD")
+)
+
+diff_comm_hub$diff <- diff_comm_hub$prob.ILD - diff_comm_hub$prob.Donor
+diff_comm_hub <- diff_comm_hub[order(-diff_comm_hub$diff), ]
+
+cat("ILD-enriched hub gene communications (pval.ILD < 0.05):\n")
+print(
+  head(
+    diff_comm_hub[diff_comm_hub$diff > 0 & diff_comm_hub$pval.ILD < 0.05, ],
+    20
+  )
+)
+
+# ==============================================================================
+cat("Mac-Fib CellChat analysis complete.\n")
+# ==============================================================================
