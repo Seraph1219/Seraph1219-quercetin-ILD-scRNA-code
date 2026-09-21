@@ -1,0 +1,173 @@
+
+Molecular Dynamics Simulation Protocol (GROMACS + Amber/GAFF)
+
+Environment
+
+• GROMACS 2023.x
+
+• AmberTools (via acpype / pdb4amber)
+
+• OpenBabel
+
+• Conda environment: acpype
+
+• Force fields: Amber99SB-ILDN (protein), GAFF (ligand), TIP3P (water)
+
+1. Ligand Preparation
+
+1.1 Convert PDBQT to PDB and add hydrogens
+
+conda activate acpype
+cd /mnt/e/VM_share/7.MolecularDynamics/mol1/
+
+# Convert PDBQT to PDB
+obabel LIG.pdbqt -O LIG.pdb
+
+# Add hydrogens (quercetin should have 10 H atoms)
+obabel LIG.pdb -O LIG_h.pdb -h
+
+# Verify hydrogen count (expect 10 for quercetin)
+grep " H " LIG_h.pdb | wc -l
+
+
+1.2 Generate GAFF topology using acpype
+
+# Generate GAFF topology (net charge = 0)
+acpype -i LIG_h.pdb -n 0 -a gaff
+
+
+This produces LIG_GMX.itp, LIG_GMX.gro, and posre_LIG.itp.
+
+2. Protein Preparation
+
+2.1 Fix missing atoms (e.g., incomplete histidine)
+
+# Using pdbfixer (OpenMM) to repair missing heavy atoms
+pdbfixer protein_raw.pdb --output=protein_fixed.pdb --add-atoms=heavy
+
+
+2.2 Generate protein topology with GROMACS pdb2gmx
+
+gmx pdb2gmx -f protein_fixed.pdb -o protein_processed.gro -water tip3p -ignh
+# Select force field: 3) Amber99SB-ILDN
+# Select water model: 1) TIP3P (already specified via -water tip3p)
+
+
+3. Build Protein–Ligand Complex
+
+3.1 Merge coordinates
+
+# Copy protein coordinates as starting point
+cp protein_processed.gro complex.gro
+
+# Manually edit complex.gro:
+# 1. Append all atom coordinates from LIG_GMX.gro
+# 2. Update the total atom count in the header (line 2)
+
+
+3.2 Update topol.top
+
+Add ligand topology and position restraints after the forcefield include:
+; Include forcefield parameters
+#include "amber99sb-ildn.ff/forcefield.itp"
+
+; Include ligand topology
+#include "LIG_GMX.itp"
+
+; Ligand position restraints
+#ifdef POSRES
+#include "posre_LIG.itp"
+#endif
+
+
+4. System Setup
+
+4.1 Define simulation box
+
+gmx editconf -f complex.gro -o newbox.gro -bt cubic -d 1.0
+
+
+4.2 Solvate
+
+gmx solvate -cp newbox.gro -cs spc216.gro -o solv.gro -p topol.top
+
+
+4.3 Add ions (neutralize)
+
+# Generate tpr for genion
+gmx grompp -f em_stage1.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 2
+
+# Replace solvent molecules with ions
+gmx genion -s ions.tpr -o solv_ions.gro -p topol.top -pname NA -nname CL -neutral -rmin 0.5
+# Select group: 15 or 16 (SOL) to replace water molecules
+
+
+5. Energy Minimization (Two-Stage)
+
+5.1 Stage 1
+
+gmx grompp -f em_stage1.mdp -c solv_ions.gro -p topol.top -o em_stage1.tpr -maxwarn 1
+gmx mdrun -deffnm em_stage1 -v -gpu_id 0
+
+
+5.2 Stage 2
+
+gmx grompp -f em_stage2.mdp -c em_stage1.gro -p topol.top -o em_stage2.tpr
+gmx mdrun -deffnm em_stage2 -v -gpu_id 0
+
+
+6. Equilibration
+
+6.1 Create index group for temperature coupling
+
+gmx make_ndx -f em_stage2.gro -o index.ndx
+# At prompt:
+#   > "Protein" | "Other"
+#   > name 20 Protein_LIG
+#   > q
+
+
+6.2 NVT equilibration (100 ps)
+
+gmx grompp -f nvt.mdp -c em_stage2.gro -r em_stage2.gro -p topol.top -n index.ndx -o nvt.tpr
+gmx mdrun -deffnm nvt -v -gpu_id 0 -nb gpu -ntomp 8 -pin on -dlb yes
+
+
+6.3 NPT equilibration (100 ps)
+
+gmx grompp -f npt.mdp -c nvt.gro -t nvt.cpt -p topol.top -n index.ndx -o npt.tpr
+gmx mdrun -deffnm npt -v -gpu_id 0 -nb gpu -ntomp 8 -pin on -dlb yes
+
+
+7. Production MD (20 ns)
+
+7.1 Run production
+
+gmx grompp -f md.mdp -c npt.gro -t npt.cpt -p topol.top -n index.ndx -o md.tpr
+gmx mdrun -s md.tpr -deffnm md -v -nb gpu -pme gpu -bonded cpu -ntomp 8 -pin on -dlb yes
+
+
+7.2 Restart from checkpoint (if needed)
+
+gmx mdrun -s md.tpr -deffnm md -cpi md.cpt -v -nb gpu -pme gpu -bonded cpu -ntomp 8 -pin on -dlb yes
+
+
+8. Post-Analysis (Optional)
+
+# RMSD, RG, etc.
+gmx rms -s md.tpr -f md.xtc -o rmsd.xvg
+gmx gyrate -s md.tpr -f md.xtc -o rg.xvg
+
+
+Notes
+
+• All ligand preparation steps were performed in a conda environment named acpype.
+
+• The ligand (quercetin) was parameterized using GAFF via acpype.
+
+• Protein force field: Amber99SB-ILDN; water model: TIP3P.
+
+• Position restraints on the ligand were applied during equilibration (force constant 1000 kJ/mol·nm²).
+
+• For reproducibility, all .mdp files and scripts are available at: [GitHub/Figshare link].
+
