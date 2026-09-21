@@ -1,0 +1,284 @@
+# ==============================================================================
+# Fibroblast Subcluster Analysis and Hub Gene Validation
+# ==============================================================================
+# Title: Subpopulation Profiling of Fibroblasts and Hub Gene Expression
+#        in ILD vs. Donor scRNA-seq Data
+#
+# Description:
+#   This script extracts fibroblast cells from the annotated Seurat object,
+#   performs unsupervised subclustering, assigns subtype labels (LipFib,
+#   ImmFib, iFib), removes contaminating clusters, evaluates subcluster
+#   composition between ILD and Donor conditions, and visualizes hub gene
+#   expression across fibroblast subtypes.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# --------------------- Section 2: Load Annotated Seurat Object --------------
+scRNA <- readRDS("03_seurat_with_celltype.rds")
+
+# Define hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Verify cell type labels
+table(scRNA@meta.data$celltype_abbr)
+
+# --------------------- Section 3: Extract Fibroblast Cells ------------------
+# Subset fibroblasts based on predefined cell type abbreviations
+fibro <- subset(scRNA, celltype_abbr %in% c("iFib", "mFib"))
+
+cat("Number of fibroblast cells:", ncol(fibro), "\n")
+table(fibro$celltype_abbr)
+
+# --------------------- Section 4: Subclustering of Fibroblasts --------------
+fibro <- FindVariableFeatures(fibro, nfeatures = 2000)
+fibro <- ScaleData(fibro)
+fibro <- RunPCA(fibro, npcs = 30)
+fibro <- FindNeighbors(fibro, dims = 1:20)
+fibro <- FindClusters(fibro, resolution = 0.4)
+fibro <- RunUMAP(fibro, dims = 1:20)
+
+# Visualize subclusters
+DimPlot(fibro, reduction = "umap", label = TRUE) +
+  ggtitle("Fibroblast Subclusters")
+
+# Identify marker genes for each subcluster
+fibro_markers <- FindAllMarkers(
+  fibro,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+# Export top 10 markers per subcluster
+fibro_top10 <- fibro_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10)
+
+write.csv(
+  fibro_top10,
+  file = "Fibroblast_cluster_top10_markers.csv",
+  row.names = FALSE
+)
+
+# --------------------- Section 5: Manual Subcluster Annotation ---------------
+# Map Seurat cluster IDs to biologically meaningful fibroblast subtypes
+fibro$subcluster <- factor(
+  case_when(
+    fibro$seurat_clusters == 0 ~ "LipFib",
+    fibro$seurat_clusters == 1 ~ "ImmFib",
+    fibro$seurat_clusters == 2 ~ "iFib",
+    TRUE                        ~ NA_character_
+  ),
+  levels = c("LipFib", "ImmFib", "iFib")
+)
+
+cat("Number of unannotated (NA) cells:", sum(is.na(fibro$subcluster)), "\n")
+table(fibro$subcluster, useNA = "ifany")
+
+# --------------------- Section 6: Remove Contaminating Clusters -------------
+fibro_clean <- subset(fibro, subset = !is.na(subcluster))
+fibro_clean$subcluster <- droplevels(fibro_clean$subcluster)
+
+# Re-run dimensionality reduction on cleaned object
+fibro_clean <- RunPCA(fibro_clean, npcs = 30)
+fibro_clean <- RunUMAP(fibro_clean, dims = 1:20)
+
+# Save UMAP plot
+if (!dir.exists("figures")) dir.create("figures")
+
+DimPlot(
+  fibro_clean,
+  reduction  = "umap",
+  group.by   = "subcluster",
+  label      = TRUE,
+  repel      = TRUE
+) + ggtitle("Clean Fibroblast Subclusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave("figures/Fibro_Clean_UMAP.pdf", width = 7, height = 6)
+
+# --------------------- Section 7: Inherit Clinical Group Labels -------------
+# Transfer condition information from the main Seurat object
+fibro_clean$condition <- scRNA$Group[Cells(fibro_clean)]
+
+table(fibro_clean$subcluster, fibro_clean$condition)
+
+# --------------------- Section 8: Proportion Plot (ILD vs. Donor) -----------
+df_fibro <- as.data.frame(table(
+  Condition  = fibro_clean$condition,
+  Subcluster = fibro_clean$subcluster
+))
+
+p_prop <- ggplot(df_fibro, aes(x = Condition, y = Freq, fill = Subcluster)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  labs(
+    title = "Fibroblast Subcluster Composition in ILD vs. Donor",
+    x     = "Condition",
+    y     = "Fraction of Fibroblast Cells"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    legend.title = element_blank()
+  )
+
+ggsave(
+  "figures/Fibro_Subcluster_Proportion_ILD_vs_Donor.pdf",
+  plot   = p_prop,
+  width  = 7,
+  height = 5
+)
+
+# --------------------- Section 9: Faceted UMAP by Condition -----------------
+umap_coords <- Embeddings(fibro_clean, reduction = "umap")
+plot_df <- data.frame(
+  UMAP_1     = umap_coords[, 1],
+  UMAP_2     = umap_coords[, 2],
+  subcluster = fibro_clean$subcluster,
+  condition  = fibro_clean$condition
+)
+
+p_umap_facet <- ggplot(
+  plot_df,
+  aes(x = UMAP_1, y = UMAP_2, color = subcluster)
+) +
+  geom_point(size = 0.3, alpha = 0.85) +
+  facet_wrap(~ condition, nrow = 1) +
+  ggtitle("Fibroblast Subclusters in ILD vs. Donor") +
+  theme_classic() +
+  theme(
+    legend.title  = element_blank(),
+    axis.text     = element_blank(),
+    axis.ticks    = element_blank(),
+    panel.border  = element_rect(color = "black", fill = NA)
+  )
+
+ggsave(
+  "figures/Fibro_UMAP_Faceted_Condition.pdf",
+  plot   = p_umap_facet,
+  width  = 10,
+  height = 4
+)
+
+# --------------------- Section 10: Hub Gene Visualization -------------------
+# Set idents for visualization
+Idents(fibro_clean) <- "subcluster"
+
+# Downsample cells per subcluster for heatmap (max 1000 per cluster)
+set.seed(123)
+cells_sampled <- lapply(levels(fibro_clean$subcluster), function(cl) {
+  cells <- WhichCells(fibro_clean, expression = subcluster == cl)
+  n_sample <- min(length(cells), 1000)
+  sample(cells, n_sample)
+})
+cells_use <- unlist(cells_sampled)
+
+# Heatmap of hub gene expression
+p_heatmap <- DoHeatmap(
+  fibro_clean,
+  cells    = cells_use,
+  features = hub_genes,
+  group.by = "subcluster",
+  slot     = "data",
+  size     = 4,
+  raster   = FALSE
+) +
+  scale_fill_gradient2(
+    low      = "blue",
+    mid      = "white",
+    high     = "red",
+    midpoint = 2.5
+  ) +
+  ggtitle("Hub Gene Expression in Fibroblast Subclusters")
+
+print(p_heatmap)
+
+# Violin plots for selected hub genes
+p_violin <- VlnPlot(
+  fibro_clean,
+  features  = c("MME", "VEGFA"),
+  group.by  = "subcluster",
+  pt.size   = 0,
+  ncol      = 2
+) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_violin)
+
+# Feature plots on UMAP
+p_feature <- FeaturePlot(
+  fibro_clean,
+  features  = c("MME", "VEGFA"),
+  reduction = "umap",
+  pt.size   = 0.5,
+  order     = TRUE
+) +
+  theme(legend.position = "right")
+
+print(p_feature)
+
+# Dot plot for all hub genes
+valid_hub_genes <- intersect(hub_genes, rownames(fibro_clean))
+if (length(valid_hub_genes) < length(hub_genes)) {
+  cat("Warning: genes not found in fibro_clean:",
+      setdiff(hub_genes, valid_hub_genes), "\n")
+}
+
+p_dot <- DotPlot(
+  object   = fibro_clean,
+  features = valid_hub_genes,
+  cols     = c("lightgrey", "red"),
+  dot.scale = 6
+) +
+  scale_color_gradient2(
+    low       = "lightgrey",
+    mid       = "white",
+    high      = "red",
+    midpoint  = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y  = element_text(size = 10),
+    plot.title   = element_text(hjust = 0.5)
+  ) +
+  ggtitle("Hub Gene Expression in Fibroblast Subclusters")
+
+ggsave("Fibro_HubGenes_DotPlot.pdf", p_dot, width = 10, height = 6)
+
+# --------------------- Section 11: Save Results -----------------------------
+fibro_final <- fibro_clean
+saveRDS(fibro_final, file = "05_Fibro_Cells_Final.rds")
+
+# Write subcluster annotations back to the main Seurat object
+scRNA$fibro_subcluster <- NA
+scRNA$fibro_subcluster[Cells(fibro_final)] <- fibro_final$subcluster
+scRNA$fibro_condition <- NA
+scRNA$fibro_condition[Cells(fibro_final)] <- fibro_final$condition
+
+saveRDS(scRNA, file = "05_Lung_Donor_vs_ILD.rds")
+
+# Export annotation mapping and marker table
+write.csv(
+  data.frame(
+    seurat_cluster = 0:2,
+    subcluster     = levels(fibro_clean$subcluster)
+  ),
+  "Fibro_Cluster_Annotation.csv",
+  row.names = FALSE
+)
+
+write.csv(fibro_markers, "Fibro_Subcluster_Markers.csv", row.names = FALSE)
+
+cat("Fibroblast subcluster analysis complete. All outputs saved.\n")
