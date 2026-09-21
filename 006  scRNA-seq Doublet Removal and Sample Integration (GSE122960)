@@ -1,0 +1,163 @@
+# ==============================================================================
+# scRNA-seq Doublet Removal and Sample Integration (GSE122960)
+# ==============================================================================
+# Title: Preprocessing and Doublet Detection of scRNA-seq Data from GSE122960
+#
+# Description:
+#   This script reads 10X Genomics H5 files from the GSE122960 dataset,
+#   creates Seurat objects, performs standard preprocessing (normalization,
+#   variable feature selection, scaling, PCA), detects and removes doublets
+#   using DoubletFinder, assigns group labels (Donor vs. ILD), and saves
+#   the cleaned Seurat object list along with a sample information table.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+# Uncomment to install if necessary:
+# remotes::install_github('chris-mcginnis-ucsf/DoubletFinder')
+library(dplyr)
+library(Seurat)
+library(hdf5r)
+library(DoubletFinder)
+
+# --------------------- Section 2: Define Input Directory ---------------------
+base_dir <- "GSE122960_H5/"
+h5_files <- list.files(base_dir, pattern = "\\.h5$", ignore.case = TRUE, full.names = FALSE)
+
+cat("Found", length(h5_files), "H5 files.\n")
+
+# --------------------- Section 3: Process Each Sample ------------------------
+#' Process a single 10X H5 file: create Seurat object, preprocess,
+#' detect doublets with DoubletFinder, and return singlet-only object.
+#'
+#' @param h5_file Character, name of the H5 file.
+#' @return A Seurat object containing only singlets.
+process_and_remove_doublets <- function(h5_file) {
+  message("Processing: ", h5_file)
+
+  # Read 10X H5 data
+  counts <- Read10X_h5(file.path(base_dir, h5_file))
+
+  # Extract sample name from filename
+  sample_name <- gsub(
+    pattern = "_filtered_gene_bc_matrices_h5\\.h5$",
+    replacement = "",
+    x = gsub("^GSM[0-9]*_", "", h5_file)
+  )
+
+  # Create Seurat object
+  sce <- CreateSeuratObject(
+    counts      = counts,
+    project     = sample_name,
+    min.cells   = 5,
+    min.features = 300
+  )
+
+  # Calculate mitochondrial percentage
+  sce <- PercentageFeatureSet(sce, pattern = "^MT-", col.name = "percent.mt")
+
+  # Standard preprocessing
+  sce <- NormalizeData(sce)
+  sce <- FindVariableFeatures(sce, nfeatures = 2000)
+  sce <- ScaleData(sce)
+  sce <- RunPCA(sce, npcs = 30)
+
+  # ---------- DoubletFinder ----------
+  # Parameter sweep to find optimal pK
+  sweep_res   <- paramSweep(sce, PCs = 1:30)
+  sweep_stats <- summarizeSweep(sweep_res, GT = FALSE)
+  pk_df       <- find.pK(sweep_stats)
+  best_pk     <- as.numeric(as.character(pk_df$pK[which.max(pk_df$BCmetric)]))
+
+  # Cluster for homotypic proportion estimation
+  sce <- FindNeighbors(sce, dims = 1:30)
+  sce <- FindClusters(sce, resolution = 0.5)
+
+  homotypic_prop <- modelHomotypic(sce$seurat_clusters)
+  nExp           <- min(round(0.075 * ncol(sce)), 500)
+  nExp_adj       <- round(nExp * (1 - homotypic_prop))
+
+  # Run doubletFinder
+  sce <- doubletFinder(
+    sce,
+    PCs   = 1:30,
+    pN    = 0.25,
+    pK    = best_pk,
+    nExp  = nExp_adj
+  )
+
+  # Extract doublet classification column (first DF.classifications.* column)
+  df_col <- grep("DF.classifications", colnames(sce@meta.data), value = TRUE)[1]
+
+  # Subset to keep only singlets
+  sce_clean <- subset(sce, subset = !!sym(df_col) == "Singlet")
+
+  message("  Original cells: ", ncol(sce),
+          " | Singlets retained: ", ncol(sce_clean))
+
+  return(sce_clean)
+}
+
+# Apply to all H5 files
+clean_scRNAlist <- lapply(h5_files, process_and_remove_doublets)
+
+# Name the list elements by project name
+names(clean_scRNAlist) <- sapply(clean_scRNAlist, function(x) x@project.name)
+
+cat("Total samples processed:", length(clean_scRNAlist), "\n")
+
+# --------------------- Section 4: Assign Group Labels ------------------------
+#' Assign Group (Donor / ILD) and Disease (sample-level) annotations
+#' based on the project name embedded in each Seurat object.
+clean_scRNAlist <- lapply(clean_scRNAlist, function(sce) {
+  fname <- sce@project.name
+
+  sce$Group <- ifelse(
+    grepl("Donor", fname, ignore.case = TRUE),
+    "Donor",
+    "ILD"
+  )
+  sce$Disease <- fname
+
+  sce
+})
+
+# Verify grouping
+lapply(clean_scRNAlist, function(sce) table(sce$Group))
+
+# --------------------- Section 5: Save Cleaned Data -------------------------
+output_rds <- "01_GSE122960_HS_cleaned_singlets.rds"
+saveRDS(clean_scRNAlist, file = output_rds)
+cat("Cleaned Seurat list saved to:", output_rds, "\n")
+
+# Quick verification: load and inspect
+saved_data <- readRDS(output_rds)
+cat("Objects in saved list:", length(saved_data), "\n")
+
+# --------------------- Section 6: Export Sample Information ------------------
+sample_info <- lapply(clean_scRNAlist, function(sce) {
+  data.frame(
+    Sample   = sce@project.name,
+    Group    = unique(sce$Group),
+    Disease  = unique(sce$Disease),
+    nCells   = ncol(sce),
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+
+write.csv(
+  sample_info,
+  file = "01_sample_info_after_doublet_removal.csv",
+  row.names = FALSE
+)
+cat("Sample information table exported.\n")
+
+# Summary of cell counts per group
+cat("Cell counts per group:\n")
+print(table(unlist(lapply(clean_scRNAlist, function(x) x$Group))))
+
+cat("Cell counts per disease:\n")
+print(table(unlist(lapply(clean_scRNAlist, function(x) x$Disease))))
+
+cat("\nDoublet removal and sample annotation complete.\n")
