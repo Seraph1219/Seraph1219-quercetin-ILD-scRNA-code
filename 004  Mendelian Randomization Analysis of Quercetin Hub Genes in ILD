@@ -1,0 +1,436 @@
+# ============================================================
+# Mendelian Randomization Analysis of Quercetin Hub Genes in ILD
+# ============================================================
+# Title: Two-Sample Mendelian Randomization Analysis of Nine
+#         Hub Genes Between Lung eQTL (GTEx v10) and Interstitial
+#         Lung Disease (FinnGen R13)
+#
+# Description:
+#   This script performs cis-eQTL-based two-sample MR to evaluate
+#   potential causal effects of nine quercetin-related hub genes
+#   on interstitial lung disease (ILD) risk.
+#
+#   No PLINK or 1KG reference panel is required; LD clumping is
+#   performed using TwoSampleMR's native clump_data() function.
+# ============================================================
+
+# --------------------- Section 0: Global Configuration ---------------------
+# Clear workspace and set working directory
+rm(list = ls())
+Sys.setLanguage("en")
+setwd("E:/VM_share/5.5MR")
+
+# Input files
+eqtl_file   <- "GTEx_Analysis_v10_eQTL_updated/Lung.v10.eQTLs.signif_pairs.parquet"
+outcome_file <- "finngen_R13_ILD.gz"
+
+# Nine hub genes of interest
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "KDR",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# LD clumping parameters
+clump_r2 <- 0.05
+clump_kb <- 1000
+
+# --------------------- Section 1: Load Required Libraries --------------------
+library(data.table)
+library(arrow)
+library(TwoSampleMR)
+library(dplyr)
+library(tidyr)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(MRPRESSO)
+library(ggplot2)
+library(ieugwasr)
+
+# --------------------- Section 2: Read GTEx v10 Lung cis-eQTL ---------------
+# Read eQTL data from parquet file
+lung_eqtl <- read_parquet(eqtl_file)
+
+# Parse variant_id (format: chr1_64764_C_T) into ref/alt alleles
+lung_eqtl <- lung_eqtl %>%
+  dplyr::mutate(
+    ref_allele     = sub(".*_([ACGT])_[ACGT]$", "\\1", variant_id),
+    alt_allele     = sub(".*_([ACGT])$", "\\1", variant_id),
+    effect_allele  = alt_allele,
+    other_allele   = ref_allele
+  )
+
+# Remove Ensembl version suffix (e.g., ENSG0000.1 -> ENSG0000)
+lung_eqtl$gene_id_clean <- sub("\\.[0-9]+$", "", lung_eqtl$gene_id)
+
+# Map gene symbols to Ensembl IDs for precise matching
+sym_ens_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys      = hub_genes,
+  columns   = "ENSEMBL",
+  keytype   = "SYMBOL"
+) %>% dplyr::distinct(SYMBOL, .keep_all = FALSE)
+
+# Keep only eQTLs corresponding to the 9 hub genes
+lung_eqtl <- lung_eqtl %>%
+  dplyr::inner_join(sym_ens_map, by = c("gene_id_clean" = "ENSEMBL")) %>%
+  dplyr::rename(gene_symbol = SYMBOL)
+
+cat("Total matched eQTL records:", nrow(lung_eqtl), "\n")
+cat("eQTL counts per gene (raw):\n")
+print(table(lung_eqtl$gene_symbol))
+
+# --------------------- Section 3: Filter by Genome-Wide Significance ---------
+# Filter eQTLs at P < 5e-8 and extract chromosomal coordinates
+hub_eqtl_raw <- lung_eqtl %>%
+  dplyr::filter(pval_nominal < 5e-8) %>%
+  dplyr::mutate(
+    CHR        = as.integer(sub("chr([0-9]+)_.*", "\\1", variant_id)),
+    BP         = as.integer(sub("chr[0-9]+_([0-9]+)_.*", "\\1", variant_id)),
+    chr_pos    = paste0("chr", CHR, "_", BP),
+    gene       = gene_symbol
+  ) %>%
+  dplyr::select(
+    SNP             = variant_id,
+    chr_pos,
+    beta            = slope,
+    se              = slope_se,
+    pval            = pval_nominal,
+    effect_allele,
+    other_allele,
+    gene
+  ) %>%
+  dplyr::filter(!is.na(beta), !is.na(se))
+
+cat("Total SNPs after P < 5e-8 filtering:", nrow(hub_eqtl_raw), "\n")
+print(table(hub_eqtl_raw$gene))
+
+# --------------------- Section 4: LD Clumping (without PLINK) ---------------
+# Perform LD-based clumping using TwoSampleMR's native function
+if (nrow(hub_eqtl_raw) > 0) {
+  hub_eqtl <- clump_data(
+    dat       = hub_eqtl_raw,
+    clump_r2  = clump_r2,
+    clump_kb  = clump_kb
+  )
+} else {
+  stop("No valid SNPs in hub_eqtl_raw; please check gene IDs and eQTL data.")
+}
+
+cat("Total SNPs after LD clumping:", nrow(hub_eqtl), "\n")
+cat("SNPs per gene after clumping:\n")
+print(table(hub_eqtl$gene))
+
+# --------------------- Section 5: Read FinnGen R13 ILD Outcome ---------------
+# Read GWAS summary statistics for ILD from FinnGen R13
+out_raw <- fread(
+  outcome_file,
+  select = c("#chrom", "pos", "ref", "alt", "beta", "sebeta", "pval", "af_alt")
+)
+colnames(out_raw) <- c("chrom", "pos", "ref", "alt", "BETA", "SE", "P", "af_alt")
+
+# Build coordinate-based ID aligned with eQTL data
+out_raw <- out_raw %>%
+  dplyr::mutate(
+    CHR     = chrom,
+    BP      = pos,
+    chr_pos = paste0("chr", CHR, "_", BP)
+  )
+outcome_all <- out_raw
+
+# --------------------- Section 6: Gene-by-Gene Two-Sample MR ---------------
+# Storage containers
+mr_total_res  <- list()
+mr_snp_detail <- list()
+fail_log       <- list()
+
+for (gene in hub_genes) {
+  cat("\n========== Running MR for Gene:", gene, "==========\n")
+
+  # Step 1: Extract eQTL instruments for current gene
+  exp_gene <- hub_eqtl %>% dplyr::filter(gene == !!gene)
+  if (nrow(exp_gene) < 3) {
+    cat(gene, "has fewer than 3 valid eQTL SNPs; skipped.\n")
+    fail_log[[gene]] <- "eQTL_SNP<3"
+    next
+  }
+
+  # Step 2: Match outcome SNPs by genomic coordinate
+  out_gene <- outcome_all %>% dplyr::filter(chr_pos %in% exp_gene$chr_pos)
+  if (nrow(out_gene) < 3) {
+    cat(gene, "has fewer than 3 matched outcome SNPs; skipped.\n")
+    fail_log[[gene]] <- "outcome_SNP<3"
+    next
+  }
+
+  # Step 3: Merge and harmonize alleles
+  merge_df <- dplyr::inner_join(
+    exp_gene %>% dplyr::select(chr_pos, beta, se, effect_allele, other_allele),
+    out_gene %>% dplyr::select(chr_pos, BETA, SE, A1 = alt, A2 = ref),
+    by = "chr_pos"
+  ) %>% dplyr::filter(!is.na(BETA), !is.na(SE))
+
+  # Keep only SNPs with matching alleles
+  merge_df <- merge_df %>%
+    dplyr::filter(
+      (effect_allele == A1 & other_allele == A2) |
+      (effect_allele == A2 & other_allele == A1)
+    )
+  # Flip beta sign if effect/other alleles are swapped
+  merge_df <- merge_df %>%
+    dplyr::mutate(beta = ifelse(effect_allele == A2, -beta, beta))
+
+  if (nrow(merge_df) < 3) {
+    cat(gene, "has fewer than 3 SNPs after allele harmonization; skipped.\n")
+    fail_log[[gene]] <- "allele_filter_SNP<3"
+    next
+  }
+  cat(gene, "final number of usable SNPs:", nrow(merge_df), "\n")
+  mr_snp_detail[[gene]] <- merge_df
+
+  # SNP weights (inverse-variance)
+  w <- 1 / (merge_df$SE ^ 2)
+
+  # --- IVW (Inverse Variance Weighted) method ---
+  beta_ivw <- sum(merge_df$beta * merge_df$BETA * w) / sum(merge_df$beta ^ 2 * w)
+  se_ivw   <- sqrt(1 / sum(merge_df$beta ^ 2 * w))
+  p_ivw    <- 2 * pnorm(-abs(beta_ivw / se_ivw))
+
+  # --- MR-Egger method ---
+  fit_eg          <- lm(BETA ~ beta, data = merge_df, weights = w)
+  beta_eg         <- coef(fit_eg)[["beta"]]
+  se_eg           <- summary(fit_eg)$coefficients["beta", "Std. Error"]
+  p_eg            <- summary(fit_eg)$coefficients["beta", "Pr(>|t|)"]
+  eg_intercept    <- coef(fit_eg)[["(Intercept)"]]
+  p_intercept     <- summary(fit_eg)$coefficients["(Intercept)", "Pr(>|t|)"]
+
+  # --- Weighted Median method ---
+  merge_df_sort <- merge_df %>% dplyr::arrange(beta)
+  cum_weight    <- cumsum(w) / sum(w)
+  wm_index      <- which(cum_weight >= 0.5)[1]
+  beta_wm       <- merge_df_sort$BETA[wm_index] / merge_df_sort$beta[wm_index]
+  se_wm         <- merge_df_sort$SE[wm_index]
+  p_wm          <- 2 * pnorm(-abs(beta_wm / se_wm))
+
+  # --- MR-PRESSO (outlier and distortion test) ---
+  presso_outlier  <- NA
+  presso_global_p <- NA
+  tryCatch({
+    presso_input <- data.frame(
+      beta.exposure = merge_df$beta,
+      beta.outcome  = merge_df$BETA,
+      se.exposure   = merge_df$se,
+      se.outcome    = merge_df$SE
+    )
+    presso_res <- mr_presso(
+      BetaOutcome    = "beta.outcome",
+      BetaExposure   = "beta.exposure",
+      SdOutcome      = "se.outcome",
+      SdExposure     = "se.exposure",
+      data           = presso_input,
+      OUTLIERtest    = TRUE,
+      DISTORTIONtest = TRUE,
+      SignifThreshold = 0.05,
+      NbDistribution  = 1000
+    )
+    presso_global_p <- presso_res$`MR-PRESSO results`$`Global Test`$Pvalue
+    if (length(presso_res$`Outlier Test`$SNP) > 0) {
+      presso_outlier <- paste(presso_res$`Outlier Test`$SNP, collapse = ";")
+    }
+  }, error = function(e) {
+    presso_outlier  <<- "Error"
+    presso_global_p <<- NA
+  })
+
+  # --- Leave-One-Out (LOO) analysis ---
+  n_snp        <- nrow(merge_df)
+  loo_beta_vec <- numeric(n_snp)
+  loo_se_vec   <- numeric(n_snp)
+  for (i in 1:n_snp) {
+    sub_dat   <- merge_df[-i, ]
+    sub_w     <- 1 / (sub_dat$SE ^ 2)
+    loo_beta_vec[i] <- sum(sub_dat$beta * sub_dat$BETA * sub_w) /
+                        sum(sub_dat$beta ^ 2 * sub_w)
+    loo_se_vec[i] <- sqrt(1 / sum(sub_dat$beta ^ 2 * sub_w))
+  }
+  mr_snp_detail[[paste0(gene, "_LOO")]] <- data.frame(
+    idx      = 1:n_snp,
+    beta_loo = loo_beta_vec,
+    se_loo   = loo_se_vec
+  )
+
+  # --- Compile summary table ---
+  line_tib <- tibble::tibble(
+    Gene               = gene,
+    SNP_Num            = n_snp,
+    IVW_OR             = exp(beta_ivw),
+    IVW_LCI            = exp(beta_ivw - 1.96 * se_ivw),
+    IVW_UCI            = exp(beta_ivw + 1.96 * se_ivw),
+    IVW_P              = p_ivw,
+    Egger_OR           = exp(beta_eg),
+    Egger_LCI          = exp(beta_eg - 1.96 * se_eg),
+    Egger_UCI          = exp(beta_eg + 1.96 * se_eg),
+    Egger_P            = p_eg,
+    Egger_Intercept    = eg_intercept,
+    Egger_Intercept_P  = p_intercept,
+    WM_OR              = exp(beta_wm),
+    WM_P               = p_wm,
+    PRESSO_Outlier_SNP = presso_outlier,
+    PRESSO_Global_P    = presso_global_p,
+    Causal_Significant = dplyr::case_when(
+      IVW_P < 0.05 & Egger_Intercept_P > 0.05 ~ "Yes",
+      TRUE                                      ~ "No"
+    )
+  )
+  mr_total_res[[gene]] <- line_tib
+  cat(gene, "IVW OR =", round(exp(beta_ivw), 3),
+      "P =", format.pval(p_ivw, 3), "\n")
+}
+
+# --------------------- Section 7: Export Summary Tables ----------------------
+final_table <- dplyr::bind_rows(mr_total_res)
+write.csv(final_table, "MR_ILD_Summary_Table.csv", row.names = FALSE)
+write.csv(as.data.frame(fail_log), "MR_Failed_Gene_Log.csv", row.names = FALSE)
+
+cat("\nSummary table saved as MR_ILD_Summary_Table.csv\n")
+print(final_table)
+
+# --------------------- Section 8: Generate Forest / Scatter / LOO Plots -----
+dir.create("MR_Plot_ILD", showWarnings = FALSE)
+setwd("./MR_Plot_ILD")
+success_genes <- names(mr_total_res)
+
+for (g in success_genes) {
+  res_row  <- final_table %>% dplyr::filter(Gene == g)
+  snp_data <- mr_snp_detail[[g]]
+  loo_data <- mr_snp_detail[[paste0(g, "_LOO")]]
+
+  # ---- (a) Forest plot: IVW / MR-Egger / Weighted Median ----
+  snp_data$abs_bexp <- abs(snp_data$beta)
+  med_w    <- median(snp_data$abs_bexp)
+  wm_pos   <- which.min(abs(snp_data$abs_bexp - med_w))
+  se_wm_p  <- snp_data$SE[wm_pos]
+
+  forest_df <- data.frame(
+    Method = c("IVW", "MR-Egger", "Weighted Median"),
+    OR     = c(res_row$IVW_OR, res_row$Egger_OR, res_row$WM_OR),
+    LCI    = c(
+      res_row$IVW_LCI,
+      res_row$Egger_LCI,
+      exp(log(res_row$WM_OR) - 1.96 * se_wm_p)
+    ),
+    UCI = c(
+      res_row$IVW_UCI,
+      res_row$Egger_UCI,
+      exp(log(res_row$WM_OR) + 1.96 * se_wm_p)
+    )
+  )
+  p_forest <- ggplot(forest_df, aes(x = Method, y = OR)) +
+    geom_point(size = 4, color = "#2c7bb6") +
+    geom_errorbar(aes(ymin = LCI, ymax = UCI), width = 0.2, linewidth = 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+    geom_text(
+      aes(label = sprintf("%.3f (%.3f-%.3f)", OR, LCI, UCI)),
+      hjust = -0.3, size = 3.5
+    ) +
+    scale_y_log10() +
+    labs(
+      title    = paste0(g, " MR Forest Plot"),
+      subtitle = paste0(
+        "SNP = ", res_row$SNP_Num,
+        "  IVW P = ", format.pval(res_row$IVW_P, 3)
+      ),
+      y = "OR (95% CI)", x = ""
+    ) +
+    theme_minimal()
+  ggsave(paste0(g, "_Forest.png"), p_forest, width = 6, height = 4.5, dpi = 300)
+
+  # ---- (b) Scatter plot: SNP effect on expression vs. ILD risk ----
+  w_scat <- 1 / (snp_data$SE ^ 2)
+  fit_scatter <- lm(BETA ~ beta, data = snp_data, weights = w_scat)
+  eg_a   <- coef(fit_scatter)[1]
+  eg_b   <- coef(fit_scatter)[2]
+  ivw_b  <- sum(snp_data$beta * snp_data$BETA * w_scat) /
+            sum(snp_data$beta ^ 2 * w_scat)
+
+  p_scatter <- ggplot(snp_data, aes(x = beta, y = BETA)) +
+    geom_point(color = "#2c7bb6", alpha = 0.6, size = 2) +
+    geom_abline(intercept = eg_a, slope = eg_b,
+                color = "red", linewidth = 1) +
+    geom_abline(intercept = 0, slope = ivw_b,
+                color = "blue", linetype = "dashed", linewidth = 0.8) +
+    labs(
+      title = paste0(g, " SNP Scatter Plot"),
+      x = "beta (expression)", y = "beta (ILD risk)"
+    ) +
+    theme_minimal()
+  ggsave(paste0(g, "_Scatter.png"), p_scatter, width = 6, height = 5, dpi = 300)
+
+  # ---- (c) Leave-One-Out (LOO) plot ----
+  loo_data$OR   <- exp(loo_data$beta_loo)
+  loo_data$low  <- exp(loo_data$beta_loo - 1.96 * loo_data$se_loo)
+  loo_data$high <- exp(loo_data$beta_loo + 1.96 * loo_data$se_loo)
+
+  p_loo <- ggplot(loo_data, aes(x = idx, y = OR)) +
+    geom_line(color = "#d73027", linewidth = 0.8) +
+    geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.2, fill = "#d73027") +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    geom_hline(yintercept = res_row$IVW_OR, color = "blue", linetype = "dotted") +
+    labs(
+      title = paste0(g, " Leave-One-Out Analysis"),
+      x = "Removed SNP Index", y = "IVW OR"
+    ) +
+    theme_minimal()
+  ggsave(paste0(g, "_LOO.png"), p_loo, width = 8, height = 4.5, dpi = 300)
+}
+
+setwd("../")
+cat("All analyses complete. Tables saved to root directory,",
+    "plots saved to MR_Plot_ILD folder.\n")
+
+
+# ============================================================================
+# ===================== Section 4b: Sensitivity Analysis =====================
+#   Re-run LD clumping with a more relaxed r^2 threshold (0.1)
+#   to assess robustness of SNP selection.
+# ============================================================================
+
+hub_eqtl_loose <- clump_data(
+  dat       = hub_eqtl_raw,
+  clump_r2  = 0.1,
+  clump_kb  = clump_kb
+)
+
+cat("SNPs retained after relaxed LD clumping (r^2 = 0.1):",
+    nrow(hub_eqtl_loose), "\n")
+print(table(hub_eqtl_loose$gene))
+
+# Export comparison table (strict vs. relaxed LD)
+write.csv(
+  data.frame(
+    Gene       = hub_genes,
+    SNP_strict = sapply(hub_genes, function(g)
+      sum(hub_eqtl$gene == g, na.rm = TRUE)),
+    SNP_loose  = sapply(hub_genes, function(g)
+      sum(hub_eqtl_loose$gene == g, na.rm = TRUE))
+  ),
+  "MR_LD_Sensitivity_Comparison.csv",
+  row.names = FALSE
+)
+
+# ----------------------------------------------------------------------------
+# Supplementary Figure: LD threshold sensitivity curve
+#   Shows how the number of retained SNPs changes with varying r^2 thresholds.
+# ----------------------------------------------------------------------------
+r2_seq <- c(0.001, 0.01, 0.05, 0.1, 0.3, 0.5, 1)
+snp_n  <- sapply(r2_seq, function(r2) {
+  nrow(clump_data(hub_eqtl_raw, clump_r2 = r2, clump_kb = 1000))
+})
+
+plot(
+  r2_seq, snp_n,
+  type  = "b",
+  xlab  = "LD r2 threshold",
+  ylab  = "Retained SNPs",
+  main  = "LD Sensitivity Analysis"
+)
+abline(h = 3, lty = 2, col = "red")  # Minimum SNP requirement for MR
