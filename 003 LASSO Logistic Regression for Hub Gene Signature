@@ -1,0 +1,360 @@
+# ==============================================================================
+# LASSO Logistic Regression for Hub Gene Signature
+# ==============================================================================
+# Title: LASSO-Based Machine Learning Model for ILD Classification
+#        Using Batch-Corrected Hub Gene Expression
+#
+# Description:
+#   This script builds a LASSO logistic regression model to identify a minimal
+#   set of hub genes that discriminate ILD from CTRL, evaluates model
+#   performance via internal 10-fold cross-validation, and generates a
+#   comprehensive figure panel including ROC, calibration, DCA, coefficient
+#   path, and expression validation plots.
+# ==============================================================================
+
+rm(list = ls())
+set.seed(123)
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(glmnet)    # LASSO regression
+library(pROC)      # ROC analysis
+library(caret)     # Cross-validation folds
+library(rms)       # Calibration curves
+library(dcurves)   # Decision curve analysis
+library(ggplot2)   # Visualization
+library(ggpubr)    # Boxplots with significance
+library(tidyr)     # Data reshaping
+library(dplyr)     # Data manipulation
+library(pheatmap)  # Heatmap
+library(patchwork) # Multi-panel assembly
+library(png)       # Read PNG for assembly
+library(grid)      # Raster annotation
+
+# --------------------- Section 2: Load Preprocessed Data ---------------------
+# Input: Lasso_Input.RDS from Boruta feature selection pipeline
+# Contents: x_batch (batch-corrected expression), stable_genes, y (Group)
+lasso_input <- readRDS("Lasso_Input.RDS")
+
+x_batch      <- lasso_input$x_batch
+stable_genes <- lasso_input$stable_genes
+y            <- lasso_input$y
+
+# Construct model matrix (samples x genes) and outcome vector
+X <- as.matrix(x_batch[, stable_genes, drop = FALSE])
+# Encode outcome: ILD = 1 (positive class), CTRL = 0
+Y <- factor(ifelse(y == "ILD", 1, 0), levels = c(1, 0), labels = c("ILD", "CTRL"))
+
+rownames(X) <- rownames(x_batch)
+names(Y)    <- rownames(X)
+stopifnot(all(rownames(X) == names(Y)))
+
+# --------------------- Section 3: LASSO Model Fitting ---------------------
+# 10-fold cross-validated LASSO (binomial deviance)
+lasso_cv <- cv.glmnet(
+  x            = X,
+  y            = Y,
+  family       = "binomial",
+  alpha        = 1,          # LASSO (L1 penalty)
+  nfolds       = 10,
+  type.measure = "deviance"
+)
+
+# Dual lambda strategy
+lambda_min <- lasso_cv$lambda.min   # Minimum deviance
+lambda_1se <- lasso_cv$lambda.1se   # Parsimonious model (within 1 SE)
+
+# Extract selected genes at both lambda values
+get_sel_genes <- function(lasso_cv, lambda) {
+  coef_sel <- coef(lasso_cv, s = lambda)
+  genes    <- rownames(coef_sel)[coef_sel[, 1] != 0]
+  genes[genes != "(Intercept)"]
+}
+
+sel_min <- get_sel_genes(lasso_cv, lambda_min)
+sel_1se <- get_sel_genes(lasso_cv, lambda_1se)
+
+cat("Genes selected at lambda.min :", length(sel_min), "\n")
+cat("Genes selected at lambda.1se:", length(sel_1se), "\n")
+
+# Use lambda.1se as the parsimonious gene signature
+final_genes <- sel_1se
+cat("Final hub gene signature:", paste(final_genes, collapse = ", "), "\n")
+
+# --------------------- Section 4: Training Set ROC ---------------------
+prob_train <- predict(lasso_cv, newx = X, s = lambda_1se, type = "response")
+prob_train_v <- as.vector(prob_train)
+
+roc_train <- roc(Y, prob_train_v, quiet = TRUE)
+auc_train <- auc(roc_train)
+cat("Training set AUC =", round(auc_train, 3), "\n")
+
+# --------------------- Section 5: 10-Fold CV ROC ---------------------
+# Manual CV to obtain out-of-fold predictions
+fold_idx <- createFolds(Y, k = 10, list = TRUE)
+cv_pred  <- numeric(length(Y))
+
+for (k in seq_len(10)) {
+  test_idx  <- fold_idx[[k]]
+  train_idx <- setdiff(seq_len(length(Y)), test_idx)
+
+  fit_k <- glmnet(
+    X[train_idx, , drop = FALSE],
+    Y[train_idx],
+    family  = "binomial",
+    alpha   = 1
+  )
+  cv_pred[test_idx] <- as.vector(
+    predict(fit_k, newx = X[test_idx, , drop = FALSE],
+            s = lambda_1se, type = "response")
+  )
+}
+
+roc_cv <- roc(Y, cv_pred, quiet = TRUE)
+auc_cv <- auc(roc_cv)
+cat("10-fold CV AUC =", round(auc_cv, 3), "\n")
+
+# --------------------- Section 6: Combined ROC Curve ---------------------
+pdf("Figure_LASSO_ROC_Combined.pdf", width = 8, height = 6)
+
+plot(roc_train,
+     col          = "#D81159",
+     lwd          = 2,
+     main         = "LASSO ROC: Training Set vs. 10-Fold CV",
+     legacy.axes  = TRUE,
+     print.auc    = FALSE)
+
+plot.roc(roc_cv,
+         col       = "#2E86AB",
+         lwd       = 2,
+         add       = TRUE,
+         print.auc = FALSE)
+
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+
+legend("bottomright",
+       legend = c(
+         paste0("Training Set (AUC = ", round(auc_train, 3), ")"),
+         paste0("10-Fold CV (AUC = ", round(auc_cv, 3), ")")
+       ),
+       col  = c("#D81159", "#2E86AB"),
+       lwd  = 2,
+       bty  = "n")
+
+dev.off()
+
+# --------------------- Section 7: Calibration Curve (ggplot2) --------------
+dat_cal <- data.frame(y = as.numeric(Y) - 1, prob = prob_train_v)
+dd <- datadist(dat_cal); options(datadist = "dd")
+
+fit_cal <- lrm(y ~ prob, data = dat_cal, x = TRUE, y = TRUE)
+cal     <- calibrate(fit_cal, method = "boot", B = 200)
+cal_df  <- as.data.frame(cal)
+
+cal_plot_df <- data.frame(
+  predy      = cal_df$x[, "predy"],
+  calibrated = cal_df$x[, "calibrated.corrected"],
+  lower      = cal_df$x[, "Lower"],
+  upper      = cal_df$x[, "Upper"]
+)
+
+ggplot(cal_plot_df, aes(x = predy, y = calibrated)) +
+  geom_line(color = "#D81159", linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Calibration Curve",
+    x     = "Predicted Probability",
+    y     = "Observed Probability"
+  ) +
+  theme_minimal() +
+  xlim(0, 1) + ylim(0, 1)
+
+ggsave("Figure_LASSO_Calibration.pdf", width = 6, height = 5, dpi = 300)
+
+# --------------------- Section 8: Decision Curve Analysis ---------------------
+dat_dca <- data.frame(y_num = as.numeric(Y) - 1, prob = prob_train_v)
+
+dca_fit <- dca(
+  y_num ~ prob,
+  data        = dat_dca,
+  thresholds  = seq(0, 0.8, by = 0.01),
+  label       = list(`LASSO Model` = "LASSO Model")
+)
+
+plot(dca_fit,
+     smooth  = TRUE,
+     col     = c(`LASSO Model` = "#D81159"),
+     linetype = "solid",
+     main    = "Decision Curve Analysis")
+
+ggsave("Figure_LASSO_DCA.png", width = 6, height = 5, dpi = 300)
+
+# --------------------- Section 9: LASSO Coefficient Path ---------------------
+pdf("Figure_LASSO_Path.pdf", width = 8, height = 6)
+
+beta_all    <- as.matrix(lasso_cv$glmnet.fit$beta)
+coef_1se    <- coef(lasso_cv, s = lambda_1se)
+nonzero_idx <- coef_1se[, 1] != 0
+nonzero_names <- rownames(coef_1se)[nonzero_idx]
+nonzero_names <- nonzero_names[nonzero_names != "(Intercept)"]
+
+beta_sel <- beta_all[nonzero_names, , drop = FALSE]
+
+matplot(
+  log(lasso_cv$glmnet.fit$lambda),
+  t(beta_sel),
+  type      = "l",
+  lty       = 1,
+  col       = rainbow(nrow(beta_sel)),
+  xlab      = "log(Lambda)",
+  ylab      = "Coefficient",
+  main      = "LASSO Coefficient Path"
+)
+
+abline(v = log(lambda_1se), lty = 2, col = "red",  lwd = 2)
+abline(v = log(lambda_min), lty = 2, col = "blue", lwd = 2)
+
+legend("topright",
+       legend = c("lambda.min", "lambda.1se"),
+       col    = c("blue", "red"),
+       lty    = 2, lwd = 2, bty = "n")
+
+dev.off()
+
+# --------------------- Section 10: Bar Plot of LASSO Coefficients ------------
+coef_df <- data.frame(
+  Gene        = rownames(coef_1se),
+  Coefficient = as.numeric(coef_1se[, 1])
+) %>%
+  filter(Coefficient != 0, Gene != "(Intercept)") %>%
+  mutate(Gene = factor(Gene, levels = Gene[order(-abs(Coefficient))]))
+
+ggplot(coef_df, aes(x = Gene, y = Coefficient)) +
+  geom_bar(
+    stat   = "identity",
+    fill   = ifelse(coef_df$Coefficient > 0, "#D81159", "#2E86AB")
+  ) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey40", linewidth = 0.5) +
+  coord_flip() +
+  labs(
+    title = "LASSO Coefficients at Lambda.1se",
+    x     = "",
+    y     = "Coefficient Value"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))
+
+ggsave("Figure_LASSO_Coefficients.png", width = 8, height = 6, dpi = 300)
+
+# --------------------- Section 11: Cross-Validation Error Plot --------------
+pdf("Figure_LASSO_CV_Error.pdf", width = 8, height = 6)
+
+plot(lasso_cv,
+     sign.lambda = -1,
+     xvar        = "lambda",
+     label       = FALSE,
+     main        = "LASSO Cross-Validation Error (Binomial Deviance)",
+     xlab        = "-Log(Lambda)",
+     ylab        = "Binomial Deviance",
+     col         = "red",
+     lwd         = 2,
+     shade.col   = "grey80")
+
+abline(v = which.min(lasso_cv$cvm),
+       col = "blue", lty = 2, lwd = 2)
+abline(v = which(lasso_cv$cvm < min(lasso_cv$cvm) + lasso_cv$cvsd)[1],
+       col = "red", lty = 2, lwd = 2)
+
+legend("topright",
+       legend = c("lambda.min", "lambda.1se"),
+       col    = c("blue", "red"),
+       lty    = 2, lwd = 2, bty = "n")
+
+dev.off()
+
+# --------------------- Section 12: Boxplot of Hub Gene Expression ------------
+box_data <- x_batch %>%
+  as.data.frame() %>%
+  dplyr::select(all_of(final_genes)) %>%
+  mutate(Group = y) %>%
+  pivot_longer(cols = -Group, names_to = "Gene", values_to = "Expression")
+
+p_box <- ggboxplot(
+  box_data,
+  x      = "Gene",
+  y      = "Expression",
+  color  = "Group",
+  palette = c("#2E86AB", "#D81159"),
+  add    = "jitter",
+  ylab   = "Expression Level (Batch-Corrected)",
+  xlab   = "Hub Genes",
+  title  = "Expression Differences of LASSO-Selected Genes"
+) +
+  stat_compare_means(
+    aes(group = Group),
+    method = "wilcox.test",
+    label  = "p.signif",
+    symnum.args = list(
+      cutpoints = c(0, 0.001, 0.01, 0.05, 1),
+      symbols   = c("***", "**", "*", "ns")
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Figure_LASSO_HubGene_Boxplot.pdf", p_box, width = 10, height = 6)
+
+# --------------------- Section 13: Heatmap of Hub Genes ---------------------
+meta_data <- data.frame(
+  Status = y,
+  row.names = rownames(x_batch)
+)
+
+hub_expr <- x_batch[, final_genes, drop = FALSE]
+
+ann_colors <- list(Status = c("CTRL" = "#2E86AB", "ILD" = "#D81159"))
+
+pheatmap(
+  hub_expr,
+  annotation_row    = meta_data,
+  annotation_colors = ann_colors,
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "row",
+  show_rownames     = FALSE,
+  show_colnames     = TRUE,
+  fontsize_col      = 10,
+  main              = "Heatmap of LASSO-Selected Hub Genes",
+  color             = colorRampPalette(c("navy", "white", "firebrick3"))(100)
+)
+
+ggsave("Figure_LASSO_HubGene_Heatmap.pdf", width = 8, height = 10)
+
+# --------------------- Section 14: Multi-Panel Assembly ---------------------
+# Read individual figure panels (if previously saved as PNG)
+panel_files <- c(
+  "Figure_LASSO_Path.png",
+  "Figure_LASSO_CV_Error.png",
+  "Figure_LASSO_Coefficients.png",
+  "Figure_LASSO_ROC_Combined.pdf",    # PDF; convert to PNG first if needed
+  "Figure_LASSO_Calibration.pdf",
+  "Figure_LASSO_DCA.png"
+)
+
+# NOTE: The assembly step below assumes all panels are available as PNG.
+# Convert PDF panels to PNG using a separate tool if necessary.
+# The following is a template; uncomment after ensuring PNG availability.
+
+# p_path  <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_Path.png"))) + theme_void()
+# p_cv    <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_CV_Error.png"))) + theme_void()
+# p_coef  <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_Coefficients.png"))) + theme_void()
+# p_roc   <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_ROC_Combined.png"))) + theme_void()
+# p_cal   <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_Calibration.png"))) + theme_void()
+# p_dca   <- ggplot() + annotation_custom(rasterGrob(readPNG("Figure_LASSO_DCA.png"))) + theme_void()
+#
+# fig <- (p_path + p_cv) / (p_coef + p_roc) / (p_cal + p_dca)
+# ggsave("Figure_1_LASSO_Assembly.png", fig, width = 16, height = 20, dpi = 300)
+
+cat("LASSO analysis complete. All figures saved.\n")
