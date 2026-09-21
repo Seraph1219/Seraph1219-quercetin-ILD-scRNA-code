@@ -1,0 +1,161 @@
+# ==============================================================================
+# Gene Ontology and KEGG Pathway Enrichment Analysis
+# ==============================================================================
+# Title: Functional Enrichment Analysis of Hub Genes Using clusterProfiler
+#
+# Description:
+#   This script performs GO (Biological Process) and KEGG pathway enrichment
+#   analysis on a user-defined list of hub genes, converts Gene Symbols to
+#   Entrez IDs, generates dot/bar plots, and exports annotated result tables
+#   with both Entrez IDs and Gene Symbols.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+# Uncomment the following line to install packages if not already installed:
+# install.packages(c("clusterProfiler", "org.Hs.eg.db", "enrichplot", "ggplot2"))
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+
+# --------------------- Section 2: Prepare Gene List ---------------------
+# Define the hub gene list (Gene Symbols)
+gene_list <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# Convert Gene Symbols to Entrez IDs (required for enrichment analysis)
+gene_entrez <- bitr(
+  gene_list,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+entrez_vector <- as.character(gene_entrez$ENTREZID)
+cat("Genes successfully mapped to Entrez IDs:", length(entrez_vector), "\n")
+
+# --------------------- Section 3: GO Enrichment Analysis ---------------------
+# Perform GO Biological Process (BP) enrichment
+ego <- enrichGO(
+  gene            = entrez_vector,
+  OrgDb           = org.Hs.eg.db,
+  keyType         = "ENTREZID",
+  ont             = "BP",
+  pAdjustMethod   = "BH",
+  pvalueCutoff    = 0.05,
+  qvalueCutoff    = 0.05
+)
+
+cat("Number of significant GO terms:", nrow(ego), "\n")
+
+# Convert to data frame and sort by q-value
+ego_df <- as.data.frame(ego)
+if (nrow(ego_df) > 0) {
+  ego_df <- ego_df[order(ego_df$qvalue), ]
+  write.csv(ego_df, "GO_Enrichment_Result.csv", row.names = FALSE)
+  cat("GO enrichment table exported: GO_Enrichment_Result.csv\n")
+}
+
+# GO dot plot (top 15 terms)
+p_go <- dotplot(ego, showCategory = 15) +
+  labs(title = "GO Biological Process Enrichment") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_go)
+ggsave("GO_Dotplot.png", p_go, width = 10, height = 7, dpi = 300)
+
+# --------------------- Section 4: KEGG Pathway Enrichment ---------------------
+# Perform KEGG pathway enrichment
+ekk <- enrichKEGG(
+  gene            = entrez_vector,
+  organism        = "hsa",
+  pvalueCutoff    = 0.05,
+  qvalueCutoff    = 0.05
+)
+
+cat("Number of significant KEGG pathways:", nrow(ekk), "\n")
+
+# Convert to data frame and sort by q-value
+ekk_df <- as.data.frame(ekk)
+if (nrow(ekk_df) > 0) {
+  ekk_df <- ekk_df[order(ekk_df$qvalue), ]
+  write.csv(ekk_df, "KEGG_Enrichment_Result.csv", row.names = FALSE)
+  cat("KEGG enrichment table exported: KEGG_Enrichment_Result.csv\n")
+}
+
+# KEGG dot plot (top 10 pathways)
+p_kegg <- dotplot(ekk, showCategory = 10) +
+  labs(title = "KEGG Pathway Enrichment") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(hjust = 1))
+
+print(p_kegg)
+ggsave("KEGG_Dotplot.png", p_kegg, width = 8, height = 6, dpi = 300)
+
+# --------------------- Section 5: Export KEGG Table with Gene Symbols --------
+# Map Entrez IDs back to Gene Symbols for the top 10 KEGG pathways
+
+if (nrow(ekk_df) > 0) {
+  top_kegg <- head(ekk_df, 10)
+
+  # Create a clean ID-to-Symbol mapping table
+  id_map <- unique(gene_entrez)
+  colnames(id_map) <- c("ENTREZID", "SYMBOL")
+
+  # Function: convert a string of "/" separated Entrez IDs to ", " separated Symbols
+  convert_ids_to_symbols <- function(entrez_string) {
+    if (is.na(entrez_string)) return(NA)
+    ids <- unlist(strsplit(entrez_string, "/"))
+    symbols <- id_map$SYMBOL[match(ids, id_map$ENTREZID)]
+    symbols[is.na(symbols)] <- ids[is.na(symbols)]
+    paste(symbols, collapse = ", ")
+  }
+
+  # Apply conversion
+  top_kegg$Gene_Symbols <- sapply(top_kegg$geneID, convert_ids_to_symbols)
+
+  write.csv(top_kegg, "KEGG_Top10_With_GeneNames.csv", row.names = FALSE)
+  cat("KEGG table with gene symbols exported: KEGG_Top10_With_GeneNames.csv\n")
+}
+
+# --------------------- Section 6: Target Enrichment Score --------------------
+# Calculate how many pathways each hub gene is associated with
+
+# Build a long-format data frame: one row per gene-pathway pair
+split_ids     <- strsplit(as.character(ekk_df$geneID), split = "/")
+pathway_desc  <- rep(ekk_df$Description, times = sapply(split_ids, length))
+all_gene_ids <- unlist(split_ids)
+
+long_df <- data.frame(
+  GeneID   = all_gene_ids,
+  Pathway  = pathway_desc,
+  stringsAsFactors = FALSE
+)
+
+# Count pathway associations per gene
+target_enrichment <- as.data.frame(table(long_df$GeneID))
+colnames(target_enrichment) <- c("Entrez_ID", "Pathway_Count")
+target_enrichment <- target_enrichment[order(-target_enrichment$Pathway_Count), ]
+
+# Convert Entrez IDs to Gene Symbols
+id_map2 <- unique(gene_entrez)
+colnames(id_map2) <- c("Entrez_ID", "Gene_Symbol")
+id_map2$Entrez_ID <- as.character(id_map2$Entrez_ID)
+
+final_result <- merge(target_enrichment, id_map2, by = "Entrez_ID", all.x = TRUE)
+final_result <- final_result[, c("Gene_Symbol", "Entrez_ID", "Pathway_Count")]
+final_result <- final_result[order(-final_result$Pathway_Count), ]
+
+cat("Top 10 targets by pathway enrichment count:\n")
+print(head(final_result, 10))
+
+write.csv(final_result, "Target_Enrichment_Score.csv", row.names = FALSE)
+cat("Target enrichment score exported: Target_Enrichment_Score.csv\n")
+
+cat("\nEnrichment analysis complete. All outputs saved.\n")
