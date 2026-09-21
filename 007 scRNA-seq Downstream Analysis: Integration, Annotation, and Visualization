@@ -1,0 +1,203 @@
+# ==============================================================================
+# scRNA-seq Downstream Analysis: Integration, Annotation, and Visualization
+# ==============================================================================
+# Title: Integrated Analysis and Cell Type Annotation of scRNA-seq Data
+#        (GSE122960) after Doublet Removal
+#
+# Description:
+#   This script loads the doublet-free Seurat object list from the previous
+#   preprocessing step, merges all samples, performs batch correction using
+#   Harmony, conducts unsupervised clustering, visualizes results with UMAP,
+#   identifies cluster marker genes, assigns cell type annotations, and exports
+#   all relevant tables and figures.
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(dplyr)
+library(Seurat)
+library(harmony)
+library(RColorBrewer)
+library(ggplot2)
+
+# --------------------- Section 2: Load Cleaned Data -------------------------
+# Load the doublet-removed Seurat object list
+sce_list <- readRDS("01_GSE122960_HS_cleaned_singlets.rds")
+
+cat("Number of samples:", length(sce_list), "\n")
+cat("Object class:", class(sce_list), "\n")
+
+# Verify doublet removal for a test sample
+test_obj <- sce_list[[1]]
+df_col <- grep("^DF.classifications", colnames(test_obj@meta.data), value = TRUE)[1]
+if (length(df_col) > 0) {
+  cat("\nDoublet distribution in first sample:\n")
+  print(table(test_obj@meta.data[[df_col]]))
+}
+cat("\nGroup distribution in first sample:\n")
+print(table(test_obj$Group))
+
+# Batch verification across all samples
+doublet_check <- lapply(sce_list, function(obj) {
+  df_col <- grep("^DF.classifications", colnames(obj@meta.data), value = TRUE)[1]
+  if (length(df_col) > 0) table(obj@meta.data[[df_col]]) else "No DF column"
+})
+print(doublet_check)
+
+# --------------------- Section 3: Merge All Samples --------------------------
+message("Merging all samples...")
+sce_merged <- merge(
+  x           = sce_list[[1]],
+  y           = sce_list[-1],
+  add.cell.ids = names(sce_list)
+)
+
+# --------------------- Section 4: Standard Preprocessing ---------------------
+message("Normalization and feature selection...")
+sce_merged <- NormalizeData(
+  sce_merged,
+  normalization.method = "LogNormalize",
+  scale.factor         = 10000
+)
+sce_merged <- FindVariableFeatures(
+  sce_merged,
+  selection.method = "vst",
+  nfeatures        = 2000
+)
+
+message("Scaling and PCA...")
+sce_merged <- ScaleData(sce_merged, features = rownames(sce_merged))
+sce_merged <- RunPCA(
+  sce_merged,
+  features = VariableFeatures(sce_merged),
+  npcs     = 30
+)
+
+# --------------------- Section 5: Batch Correction with Harmony -------------
+message("Running Harmony for batch correction...")
+sce_merged <- RunHarmony(
+  object        = sce_merged,
+  group.by.vars = "Group",   # Correct for Donor vs. ILD grouping
+  dims.use      = 1:30
+)
+
+# --------------------- Section 6: Clustering and UMAP -----------------------
+message("Building KNN graph and clustering...")
+sce_merged <- FindNeighbors(sce_merged, reduction = "harmony", dims = 1:30)
+sce_merged <- FindClusters(sce_merged, resolution = 0.5)
+
+message("Generating UMAP embedding...")
+sce_merged <- RunUMAP(sce_merged, reduction = "harmony", dims = 1:30)
+
+# UMAP visualizations
+p_cluster <- DimPlot(sce_merged, reduction = "umap", label = TRUE, repel = TRUE) +
+  ggtitle("UMAP by Clusters") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_group <- DimPlot(sce_merged, reduction = "umap", group.by = "Group") +
+  ggtitle("UMAP by Group (Donor vs. ILD)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_sample <- DimPlot(sce_merged, reduction = "umap", group.by = "Disease") +
+  ggtitle("UMAP by Sample") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p_cluster)
+print(p_group)
+print(p_sample)
+
+# --------------------- Section 7: Export Metadata and Markers --------------
+# Add UMAP coordinates to metadata
+cell_metadata <- sce_merged@meta.data
+umap_coords   <- Embeddings(sce_merged, "umap")
+cell_metadata$UMAP_1 <- umap_coords[, 1]
+cell_metadata$UMAP_2 <- umap_coords[, 2]
+write.csv(cell_metadata, "01_Cell_Metadata_with_Annotation.csv", row.names = TRUE)
+
+# Find all cluster markers
+sce_merged <- JoinLayers(sce_merged)
+markers <- FindAllMarkers(
+  sce_merged,
+  only.pos          = TRUE,
+  min.pct           = 0.25,
+  logfc.threshold   = 0.25
+)
+
+# Export significant markers (adj. p-value < 0.05)
+sig_markers <- markers %>%
+  dplyr::filter(p_val_adj < 0.05) %>%
+  dplyr::arrange(cluster, desc(avg_log2FC))
+write.csv(sig_markers, "02_All_Significant_Markers.csv", row.names = FALSE)
+cat("Significant markers exported: 02_All_Significant_Markers.csv\n")
+
+# Export top 10 markers per cluster
+top10_markers <- markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 10) %>%
+  dplyr::ungroup()
+write.csv(top10_markers, "03_Top10_Markers_Per_Cluster.csv", row.names = FALSE)
+cat("Top 10 markers per cluster exported: 03_Top10_Markers_Per_Cluster.csv\n")
+
+# --------------------- Section 8: Cell Type Annotation -----------------------
+# Manual cell type assignment based on canonical marker genes
+# Order corresponds to cluster IDs 0–25
+
+celltype_abbr <- c(
+  "SPP1+Mac",     # 0
+  "AT2",          # 1
+  "CD8T",         # 2
+  "LAMac",        # 3
+  "MDM",          # 4
+  "BSEC",         # 5
+  "SEC",          # 6
+  "iFib",         # 7
+  "Neutrophil",   # 8
+  "NK",           # 9
+  "Cap.EC",       # 10
+  "Club",         # 11
+  "AT1",          # 12
+  "InfMac",       # 13
+  "B",            # 14
+  "B cell",       # 15
+  "DC",           # 16
+  "ASEC",         # 17
+  "Mast",         # 18
+  "SecEpi",       # 19
+  "CilEpi",       # 20
+  "mFib",         # 21
+  "Plasma",       # 22
+  "Prolif",       # 23
+  "LEC",          # 24
+  "Basal"         # 25
+)
+
+# Map cluster IDs to cell type labels
+sce_merged$celltype_abbr <- celltype_abbr[
+  as.numeric(as.character(sce_merged$seurat_clusters)) + 1
+]
+sce_merged$celltype_abbr <- factor(
+  sce_merged$celltype_abbr,
+  levels = celltype_abbr
+)
+
+# Save annotated Seurat object
+saveRDS(sce_merged, "03_seurat_with_celltype.rds")
+cat("Annotated Seurat object saved: 03_seurat_with_celltype.rds\n")
+
+# --------------------- Section 9: Annotated UMAP Visualization --------------
+# Generate a color palette for all cell types
+cols <- rep(brewer.pal(12, "Paired"), length.out = length(celltype_abbr))
+
+p_celltype <- DimPlot(
+  sce_merged,
+  reduction = "umap",
+  group.by  = "celltype_abbr",
+  label     = TRUE,
+  cols      = cols
+) + theme_minimal()
+
+print(p_celltype)
+ggsave("UMAP_by_CellType.png", p_celltype, width = 10, height = 8, dpi = 300)
+
+cat("\nDownstream analysis complete. All outputs saved.\n")
