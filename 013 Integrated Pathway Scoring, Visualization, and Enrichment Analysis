@@ -1,0 +1,436 @@
+# ==============================================================================
+# Integrated Pathway Scoring, Visualization, and Enrichment Analysis
+# ==============================================================================
+# Title: UCell-Based Pathway Activity Scoring, Cell-Type-Specific Validation,
+#        and Functional Enrichment Analysis of Hub Genes in ILD
+#
+# Description:
+#   This script performs:
+#   1. UCell module scoring for 9 hub genes across all cells
+#   2. Cell-type-specific violin plot comparison (ILD vs. Donor)
+#   3. Hub gene FeaturePlots restricted to ILD samples
+#   4. Split DotPlot showing hub gene expression by cell type and condition
+#   5. GO and KEGG enrichment analysis of hub genes
+#   6. Cell-type-specific GSEA (GO and KEGG) for 7 target cell types
+# ==============================================================================
+
+rm(list = ls())
+
+# --------------------- Section 1: Load Required Libraries ---------------------
+library(Seurat)
+library(UCell)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(openxlsx)
+library(rstatix)
+library(tidyr)
+library(ggsignif)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(purrr)
+
+# --------------------- Section 2: Load Fine-Annotated Seurat Object -----------
+scRNA <- readRDS("07_Lung_Donor_vs_ILD_celltype_fine_cleaned.rds")
+
+# Ensure Group factor levels are ordered (Donor = control, ILD = disease)
+scRNA$Group <- factor(scRNA$Group, levels = c("Donor", "ILD"))
+
+# Define hub genes
+hub_genes <- c(
+  "CBS", "COL3A1", "EGFR", "IL6", "VEGFA",
+  "MME", "MMP1", "SERPINE1", "TTR"
+)
+
+# --------------------- Section 3: UCell Module Scoring ------------------------
+# Calculate composite pathway activity score across all cells
+scRNA <- AddModuleScore_UCell(
+  scRNA,
+  features = list(Main_Pathway = hub_genes),
+  assay = "RNA"
+)
+
+# Extract scoring data for downstream visualization
+pathway_data <- data.frame(
+  Group     = scRNA$Group,
+  CellType  = scRNA$celltype_fine_corrected,
+  Score     = scRNA$Main_Pathway_UCell
+)
+
+# Verify cell type distribution
+table(scRNA$celltype_fine_corrected, useNA = "ifany")
+
+# --------------------- Section 4: Statistical Testing (Disease vs. Donor) ----
+# Filter cell types with sufficient cells in both conditions (n >= 3 per group)
+pathway_summary <- pathway_data %>%
+  group_by(CellType, Group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Group, values_from = n_cells, values_fill = 0) %>%
+  filter(Donor >= 3 & ILD >= 3)
+
+valid_celltypes <- pathway_summary$CellType
+
+pathway_data_filtered <- pathway_data %>%
+  filter(CellType %in% valid_celltypes)
+
+# Wilcoxon rank-sum test with Bonferroni correction
+stat_res <- pathway_data_filtered %>%
+  group_by(CellType) %>%
+  wilcox_test(Score ~ Group) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance()
+
+print(stat_res)
+
+# --------------------- Section 5: Hub Gene FeaturePlots (ILD Only) ------------
+# Subset to ILD samples for focused visualization
+scRNA_ILD <- subset(scRNA, subset = Group == "ILD")
+
+p_list <- list()
+for (gene in hub_genes) {
+  p <- FeaturePlot(
+    object   = scRNA_ILD,
+    features = gene,
+    pt.size  = 0.4,
+    order    = TRUE,
+    cols     = c("lightgrey", "red")
+  ) +
+    ggtitle(gene) +
+    theme(
+      plot.title      = element_text(hjust = 0.5, size = 14, face = "bold"),
+      legend.position = "none",
+      axis.text       = element_blank(),
+      axis.title      = element_blank(),
+      axis.ticks      = element_blank(),
+      panel.grid      = element_blank(),
+      plot.margin     = margin(2, 2, 2, 2)
+    )
+  p_list[[gene]] <- p
+}
+
+p_feature_ild <- wrap_plots(p_list, ncol = 5) +
+  plot_annotation(
+    title = "Expression of 9 Hub Genes in ILD Samples",
+    theme = theme(plot.title = element_text(hjust = 0.5, size = 16))
+  )
+
+ggsave(
+  "Figure_4A_HubGenes_FeaturePlot.pdf",
+  plot   = p_feature_ild,
+  width  = 15,
+  height = 8,
+  dpi    = 300
+)
+
+# --------------------- Section 6: Violin Plot with Significance ---------------
+# Prepare significance annotation data
+signif_data <- stat_res %>%
+  filter(p.adj < 0.05) %>%
+  left_join(
+    pathway_data_filtered %>% group_by(CellType) %>% summarise(max_score = max(Score)),
+    by = "CellType"
+  ) %>%
+  mutate(
+    xmin       = 1,
+    xmax       = 2,
+    y_position = max_score * 1.15
+  )
+
+# Violin plot
+p_violin <- ggplot(pathway_data_filtered, aes(x = Group, y = Score, fill = Group)) +
+  geom_violin(alpha = 0.8, trim = TRUE, scale = "width") +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.6, fill = "white") +
+  geom_signif(
+    data        = signif_data,
+    aes(xmin = xmin, xmax = xmax, annotations = p.adj.signif, y_position = y_position),
+    manual      = TRUE,
+    tip_length  = 0.01,
+    size        = 0.5,
+    textsize    = 25,
+    vjust       = -0.2,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("Donor" = "#A6CEE3", "ILD" = "#E31A1C")) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 25) +
+  theme(
+    panel.grid        = element_blank(),
+    strip.background  = element_rect(fill = "white", color = "grey80"),
+    strip.text        = element_text(size = 28, face = "bold", color = "black"),
+    plot.title        = element_text(size = 30, face = "bold", hjust = 0.5),
+    plot.subtitle     = element_text(size = 25, hjust = 0.5, color = "grey40"),
+    axis.title.y      = element_text(size = 30, face = "bold"),
+    axis.text.y       = element_text(size = 30),
+    legend.position   = "top",
+    legend.text       = element_text(size = 25),
+    legend.title      = element_text(size = 25, face = "bold"),
+    axis.title.x      = element_blank(),
+    axis.text.x       = element_blank(),
+    axis.ticks.x      = element_blank(),
+    plot.margin       = margin(t = 40, r = 20, b = 20, l = 20)
+  ) +
+  labs(
+    title    = "Cell-type Specific Activity of Core Hub Pathway",
+    subtitle = "ILD vs. Donor Comparison",
+    y        = "UCell Module Score"
+  )
+
+ggsave(
+  "Lung_Hub_Pathway_Violin.pdf",
+  plot   = p_violin,
+  width  = 16,
+  height = 32,
+  dpi    = 300,
+  bg     = "white"
+)
+
+# --------------------- Section 7: Split DotPlot by Condition ------------------
+p_dot <- DotPlot(
+  scRNA,
+  features  = hub_genes,
+  group.by  = "celltype_fine_corrected",
+  split.by  = "Group",
+  cols      = c("lightgrey", "red")
+) +
+  RotatedAxis() +
+  ggtitle("Hub Genes Expression by Cell Type and Disease Status") +
+  theme(
+    plot.title.position = "plot",
+    plot.title          = element_text(hjust = 0.5, size = 15, face = "bold"),
+    axis.text.y         = element_text(size = 10),
+    axis.text.x         = element_text(size = 14),
+    legend.title        = element_text(size = 12),
+    legend.text         = element_text(size = 10),
+    strip.text          = element_text(size = 10)
+  )
+
+ggsave("DotPlot_Hub_Split.pdf", p_dot, width = 8, height = 20, dpi = 300)
+
+# --------------------- Section 8: GO and KEGG Enrichment of Hub Genes ---------
+# Convert gene symbols to Entrez IDs
+gene_entrez <- bitr(
+  hub_genes,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+# KEGG enrichment
+kk <- enrichKEGG(
+  gene         = gene_entrez$ENTREZID,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+
+p_kk <- dotplot(kk, showCategory = 10, title = "A. KEGG Pathway Enrichment") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggsave("Figure_KEGG_Dotplot.pdf", p_kk, width = 8, height = 5, dpi = 300)
+
+# GO Biological Process enrichment
+ego <- enrichGO(
+  gene          = gene_entrez$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+p_go <- dotplot(ego, showCategory = 10, title = "B. GO Biological Process") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggsave("Figure_GO_Dotplot.pdf", p_go, width = 8, height = 5, dpi = 300)
+
+# Combined KEGG + GO figure
+p_combined <- wrap_plots(p_kk, p_go, nrow = 1, guides = "collect")
+ggsave(
+  "Figure_KEGG_GO_Combined.pdf",
+  plot      = p_combined,
+  width     = 16,
+  height    = 5,
+  dpi       = 300
+)
+
+# Export enrichment results to Excel
+write.xlsx(
+  list(
+    KEGG = as.data.frame(kk),
+    GO_BP = as.data.frame(ego)
+  ),
+  "Enrichment_Supplementary_Table.xlsx",
+  overwrite = TRUE
+)
+
+# --------------------- Section 9: Cell-Type-Specific GSEA ---------------------
+# Target cell types for GSEA
+target_cells <- c(
+  "AT1", "BATEC", "AM", "CilEPi", "Club", "InfMac", "LAMac"
+)
+
+# Function to run GSEA for a single cell type
+run_gsea_celltype <- function(celltype) {
+
+  # Check if cell type exists
+  if (!celltype %in% scRNA$celltype_fine_corrected) {
+    message("Skip ", celltype, ": not present in object")
+    return(NULL)
+  }
+
+  # Subset cells
+  idx <- WhichCells(scRNA, expression = celltype_fine_corrected == celltype)
+  if (length(idx) == 0) {
+    message("Skip ", celltype, ": 0 cells after subset")
+    return(NULL)
+  }
+
+  sub <- subset(scRNA, cells = idx)
+
+  # Verify both conditions are present with sufficient cells
+  tab <- table(sub$Group)
+  if (!all(c("ILD", "Donor") %in% names(tab))) {
+    message("Skip ", celltype, ": missing ILD or Donor")
+    return(NULL)
+  }
+  if (any(tab[c("ILD", "Donor")] < 3)) {
+    message("Skip ", celltype, ": too few cells (",
+            paste(tab["Donor"], tab["ILD"], sep = "/"), ")")
+    return(NULL)
+  }
+
+  # Differential expression analysis
+  deg <- FindMarkers(
+    sub,
+    group.by        = "Group",
+    ident.1         = "ILD",
+    ident.2         = "Donor",
+    assay           = "RNA",
+    logfc.threshold = 0,
+    min.pct         = 0.1
+  )
+
+  if (nrow(deg) == 0) {
+    message("No DEGs for ", celltype)
+    return(NULL)
+  }
+
+  # Rank genes by avg_log2FC * -log10(p_val)
+  deg$rank <- deg$avg_log2FC * (-log10(deg$p_val))
+  rank_vec <- sort(deg$rank, decreasing = TRUE)
+  names(rank_vec) <- rownames(deg)
+
+  # GO GSEA
+  gsea_go <- tryCatch({
+    gseGO(
+      geneList      = rank_vec,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "SYMBOL",
+      ont           = "BP",
+      pvalueCutoff  = 0.05,
+      verbose       = FALSE
+    )
+  }, error = function(e) {
+    message("GO GSEA failed for ", celltype)
+    NULL
+  })
+
+  # KEGG GSEA (requires Entrez ID conversion)
+  gsea_kk <- NULL
+  bitr_res <- tryCatch(
+    bitr(names(rank_vec), fromType = "SYMBOL", toType = "ENTREZID",
+         OrgDb = org.Hs.eg.db),
+    error = function(e) NULL
+  )
+
+  if (!is.null(bitr_res) && nrow(bitr_res) > 0) {
+    rank_entrez <- rank_vec[bitr_res$SYMBOL]
+    names(rank_entrez) <- bitr_res$ENTREZID
+    rank_entrez <- sort(rank_entrez, decreasing = TRUE)
+
+    gsea_kk <- tryCatch({
+      gseKEGG(
+        geneList      = rank_entrez,
+        organism      = "hsa",
+        pvalueCutoff  = 0.05,
+        verbose       = FALSE
+      )
+    }, error = function(e) {
+      message("KEGG GSEA failed for ", celltype)
+      NULL
+    })
+  }
+
+  # Export GSEA plots (top 5 pathways)
+  safe_name <- gsub("[^[:alnum:]]", "_", celltype)
+
+  if (!is.null(gsea_go) && nrow(gsea_go@result) > 0) {
+    pdf(paste0("GSEA_GO_", safe_name, ".pdf"), width = 6, height = 5)
+    print(gseaplot2(
+      gsea_go,
+      geneSetID = 1:min(5, nrow(gsea_go@result)),
+      title     = paste("GO GSEA:", celltype)
+    ))
+    dev.off()
+  }
+
+  if (!is.null(gsea_kk) && nrow(gsea_kk@result) > 0) {
+    pdf(paste0("GSEA_KEGG_", safe_name, ".pdf"), width = 6, height = 5)
+    print(gseaplot2(
+      gsea_kk,
+      geneSetID = 1:min(5, nrow(gsea_kk@result)),
+      title     = paste("KEGG GSEA:", celltype)
+    ))
+    dev.off()
+  }
+
+  list(CellType = celltype, GO = gsea_go, KEGG = gsea_kk)
+}
+
+# Run GSEA for all target cell types
+gsea_results <- lapply(target_cells, run_gsea_celltype)
+names(gsea_results) <- target_cells
+gsea_results <- Filter(Negate(is.null), gsea_results)
+names(gsea_results) <- sapply(gsea_results, "[[", "CellType")
+
+# --------------------- Section 10: Export GSEA Summary Tables ----------------
+# Extract significant pathway tables per cell type
+supplement <- lapply(gsea_results, function(x) {
+  go_df <- if (!is.null(x$GO) && nrow(x$GO@result) > 0) {
+    as.data.frame(x$GO@result) %>% mutate(CellType = x$CellType)
+  } else NULL
+
+  kegg_df <- if (!is.null(x$KEGG) && nrow(x$KEGG@result) > 0) {
+    as.data.frame(x$KEGG@result) %>% mutate(CellType = x$CellType)
+  } else NULL
+
+  list(GO = go_df, KEGG = kegg_df)
+})
+
+# Merge and export to Excel
+go_list   <- Filter(Negate(is.null), lapply(supplement, "[[", "GO"))
+kegg_list <- Filter(Negate(is.null), lapply(supplement, "[[", "KEGG"))
+
+write.xlsx(
+  list(
+    GO   = bind_rows(go_list),
+    KEGG = bind_rows(kegg_list)
+  ),
+  "GSEA_Supplementary_Table.xlsx",
+  overwrite = TRUE
+)
+
+# --------------------- Section 11: Save Final Object -------------------------
+saveRDS(scRNA, "08_Lung_Donor_vs_ILD_Final.rds")
+
+cat("Integrated pathway scoring, visualization, and enrichment analysis complete.\n")
